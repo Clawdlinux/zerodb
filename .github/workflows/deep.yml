@@ -1,0 +1,72 @@
+# Slow checks: power loss on a real filesystem, and the sims with a large seed budget.
+# Nightly, on demand, and on pull requests that touch the tape or this harness.
+name: deep
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Power cuts
+        default: "60"
+      seed:
+        description: Power-loss seed, empty for random
+        default: ""
+  pull_request:
+    paths:
+      - crates/zerodb-tape/src/**
+      - tests/crash/**
+      - .github/workflows/deep.yml
+permissions:
+  contents: read
+concurrency:
+  group: deep-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  power-loss:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get install -y --no-install-recommends g++ cmake libfuse3-dev fuse3
+      - run: sudo sed -i 's/^#\s*user_allow_other/user_allow_other/' /etc/fuse.conf
+      - id: lazyfs
+        uses: actions/cache@v4
+        with:
+          path: ~/lazyfs
+          key: lazyfs-${{ hashFiles('tests/crash/build-lazyfs.sh') }}-ubuntu-24.04
+      - if: steps.lazyfs.outputs.cache-hit != 'true'
+        run: tests/crash/build-lazyfs.sh ~/lazyfs
+      - run: cargo build --locked --release -p zerodb
+      - run: python3 tests/crash/power_loss.py --lazyfs ~/lazyfs
+        env:
+          LD_LIBRARY_PATH: /home/runner/lazyfs/libs/libpcache/build
+          ZERODB_CRASH_ROUNDS: ${{ inputs.rounds || (github.event_name == 'schedule' && '60') || '20' }}
+          ZERODB_CRASH_SEED: ${{ inputs.seed }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: power-loss-logs
+          path: |
+            target/power-loss/*.log
+            target/power-loss/*.out
+          if-no-files-found: ignore
+
+  sims:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ZERODB_SIM_SEEDS: "20000"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # A new window of seeds each run. Failures print the seed to rerun.
+      - run: echo "ZERODB_SIM_SEED=$((GITHUB_RUN_NUMBER * ZERODB_SIM_SEEDS))" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p zerodb-tape --release --features sim --test sim
+      - run: cargo test --locked -p zerodb-core --release --features sim --test engine_sim

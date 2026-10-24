@@ -5,32 +5,39 @@ on:
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Installs the toolchain and components from rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo test --workspace --release
-      - run: cargo test -p zerodb-tape --release --features sim --test sim
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo test --locked --workspace --release
+      - run: cargo test --locked -p zerodb-tape --release --features sim --test sim
         env:
           ZERODB_SIM_SEEDS: "2000"
-      - run: cargo test -p zerodb-core --release --features sim --test engine_sim
+      - run: cargo test --locked -p zerodb-core --release --features sim --test engine_sim
         env:
           ZERODB_SIM_SEEDS: "2000"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python3 -m pip install -r clients/python/requirements-test.txt
-      - run: cargo test -p zerodb --release --features fault-inject --test it -- --include-ignored
+      - run: cargo test --locked -p zerodb --release --features fault-inject --test it -- --include-ignored
       # Rebuild without test dev-dependencies, so pytest runs the binary users get, not one with zerodb-tape's sim code.
-      - run: cargo build -p zerodb --release --features fault-inject
+      - run: cargo build --locked -p zerodb --release --features fault-inject
       - run: ZERODB_BIN=target/release/zerodb python3 -m pytest clients/python/tests

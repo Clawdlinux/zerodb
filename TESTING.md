@@ -72,6 +72,24 @@ The oracles check rejection state, read-only recovery, and acknowledged durabili
 The engine sim also checks dedup state and verifies rejected-key retries commit exactly once.
 Failures print the seed, the capacity plan and the command that reproduces the run.
 
+## Power loss
+
+`tests/crash/power_loss.py` runs the release binary on [LazyFS](https://github.com/dsrhaslab/lazyfs), a FUSE filesystem that holds unsynced writes in memory.
+Killing LazyFS drops them, as a power cut does. Each round cuts power at a random moment or at a chosen syscall, such as before a segment `fsync` or after a `MANIFEST` rename.
+After each cut it runs `zerodb verify` on the raw directory, reopens, and checks that every acknowledged turn is back at its sequence, sequences are dense, and no batch is partial.
+
+The `deep` workflow runs it nightly with 60 cuts, and on pull requests that touch `zerodb-tape/src` with 20. It needs Linux and FUSE:
+
+```sh
+tests/crash/build-lazyfs.sh ~/lazyfs
+ZERODB_CRASH_SEED=<seed> python3 tests/crash/power_loss.py --lazyfs ~/lazyfs
+```
+
+The build script pins LazyFS and adds `statfs`. Without it FUSE reports 0 free bytes, and zerodb's disk-full floor keeps it read-only.
+
+LazyFS passes metadata calls such as `rename` straight to the disk below, so it cannot catch a missing directory sync. It has no `fallocate`, so segments use the zero-fill fallback there.
+The same nightly job runs both sims on 20,000 new seeds each night.
+
 ## Before adding a test
 
 Look for an existing scenario that already drives the path. Extend it. If you add a test, check whether two old ones can now merge.

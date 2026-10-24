@@ -1,3 +1,4 @@
 [toolchain]
-channel = "stable"
+# Pinned so a new stable's lints cannot fail CI without a code change. Bump it in its own PR.
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
