@@ -125,13 +125,15 @@ Under agent load zerodb has the best p50 and p99.9 of the 4 servers. Its p50 is 
 
 Runs on this VM land in a fast or a slow mode at random. Steal time stays 0. The 4 servers often move together. On NVMe at 256 writers with 50 ms think, reps 1 and 2 were fast for all 4. Their p99 was 225 to 301 µs. Rep 3 was slow for all 4: 636 to 765 µs. SQLite, in process, shows no slow reps here. On NVMe its acks and p99 stay within 16% across reps.
 
-Rep 1 at 1 writer on NVMe was slow on acks for zerodb, Redis and Valkey: 4,404, 1,928 and 5,512/s. Their medians are 9,799, 8,110 and 8,434. Rep 1 was the first load of the whole run, so it may be warm-up. Each rep ran the systems in a fixed order: zerodb, Redis, Valkey, DiceDB, SQLite. So zerodb always ran first. Any warm-up effect hits zerodb's slot first.
+Rep 1 at 1 writer on NVMe was slow on acks for zerodb, Redis and Valkey: 4,404, 1,928 and 5,512/s. Their medians are 9,799, 8,110 and 8,434. Rep 1 was the first load of the whole run, so it may be warm-up. In that run each rep used a fixed order, with zerodb first, so any warm-up hit zerodb's slot. `h2h.sh` now shuffles the order every rep.
 
 A per-append trace of zerodb found every stage slower together in slow runs. That includes `fdatasync`, which went from 26 to 65 µs. No single wait in zerodb explains it. [#48](https://github.com/Clawdlinux/zerodb/issues/48) tracks the cause.
 
 With 3 reps, the mode a run landed in decided p99. In 8 adjacent pairs at 256 writers with 50 ms think, zerodb had the lower p99 in 6 ([#47](https://github.com/Clawdlinux/zerodb/issues/47)). So the harness now runs 7 reps, interleaved. Per rep in the TSVs, zerodb's 256-writer p99 beat Redis in 7 of 7 reps. It beat Valkey in 4 and DiceDB in 5. At 64 writers it beat each in 5 of 7.
 
 Agent-shaped p99 medians still move a lot between runs. Read the p99 range next to the median.
+
+The summary now also gives each system's throughput as a ratio to Redis within the same rep, `H2H_CONTROL`. A slow mode hits every system in the rep, so the ratio stays put when the absolute numbers move. Compare systems by that ratio.
 
 ## Client
 
@@ -147,6 +149,8 @@ With 1 client zerodb's 16-writer NVMe p99 beat Redis, Valkey and DiceDB in 7 of 
 | dicedb | 57,439 | 44,693 | 367 | 547 |
 
 The Python client likely costs more CPU than memtier on the same 8 vCPUs. We haven't measured why the Redis family loses more. The 2 runs are on different days and zerodb revisions (`d40f048`, `02b43e5`), so treat these deltas as rough.
+
+The client shares the server's vCPUs. On an L16s_v3 we pinned the server to vCPUs 0-7 and moved the client between 0-7 and 8-15 (`H2H_SERVER_CPUS`, `H2H_CLIENT_CPUS`). Its own vCPUs raised zerodb by 19% and 28% at 64 and 128 writers, and Redis by 24% and 27%. The zerodb-to-Redis ratio stayed at 0.88 at 128 writers. So the shared client lowers every system's absolute numbers, but it doesn't explain zerodb's gap to Redis. That gap is in the server ([#52](https://github.com/Clawdlinux/zerodb/issues/52)). Details are in [RESULTS.md](RESULTS.md).
 
 ## Not covered
 
