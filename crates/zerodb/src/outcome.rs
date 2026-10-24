@@ -71,128 +71,41 @@ impl Merge {
 
 #[cfg(test)]
 mod tests {
+    use super::Outcome::{Committed as C, NotCommitted as N, Unknown as U};
     use super::*;
 
-    const C: Attempt = Attempt::Answered(Outcome::Committed);
-    const N: Attempt = Attempt::Answered(Outcome::NotCommitted);
-    const U: Attempt = Attempt::Answered(Outcome::Unknown);
     const T: Attempt = Attempt::TransportError;
     const S: Attempt = Attempt::NotSent;
-
-    struct Case {
-        name: &'static str,
-        previous: &'static [Attempt],
-        this: Attempt,
-        step: Option<Outcome>,
-        finish: Outcome,
+    const fn a(outcome: Outcome) -> Attempt {
+        Attempt::Answered(outcome)
     }
-
-    const CASES: &[Case] = &[
-        Case {
-            name: "first committed",
-            previous: &[],
-            this: C,
-            step: Some(Outcome::Committed),
-            finish: Outcome::Committed,
-        },
-        Case {
-            name: "committed after unknown",
-            previous: &[U],
-            this: C,
-            step: Some(Outcome::Committed),
-            finish: Outcome::Committed,
-        },
-        Case {
-            name: "committed after transport",
-            previous: &[T, U],
-            this: C,
-            step: Some(Outcome::Committed),
-            finish: Outcome::Committed,
-        },
-        Case {
-            name: "first not_committed",
-            previous: &[],
-            this: N,
-            step: Some(Outcome::NotCommitted),
-            finish: Outcome::NotCommitted,
-        },
-        Case {
-            name: "not_committed after transport",
-            previous: &[T],
-            this: N,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-        Case {
-            name: "not_committed after unknown",
-            previous: &[U],
-            this: N,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-        Case {
-            name: "not_committed twice after unknown",
-            previous: &[U, N],
-            this: N,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-        Case {
-            name: "first unknown",
-            previous: &[],
-            this: U,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-        Case {
-            name: "first transport",
-            previous: &[],
-            this: T,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-        Case {
-            name: "only connect failures",
-            previous: &[S],
-            this: S,
-            step: None,
-            finish: Outcome::NotCommitted,
-        },
-        Case {
-            name: "connect failure after unknown",
-            previous: &[U],
-            this: S,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-        Case {
-            name: "transport after connect failure",
-            previous: &[S],
-            this: T,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-        Case {
-            name: "transport after unknown",
-            previous: &[U],
-            this: T,
-            step: None,
-            finish: Outcome::Unknown,
-        },
-    ];
 
     #[test]
     fn merge_follows_the_outcome_rule() {
-        for case in CASES {
+        // (case, attempts, what the last attempt reports, result at the deadline)
+        let cases: [(&str, &[Attempt], Option<Outcome>, Outcome); 13] = [
+            ("first committed", &[a(C)], Some(C), C),
+            ("committed after unknown", &[a(U), a(C)], Some(C), C),
+            ("committed after transport", &[T, a(U), a(C)], Some(C), C),
+            ("first not_committed", &[a(N)], Some(N), N),
+            ("not_committed after transport", &[T, a(N)], None, U),
+            ("not_committed after unknown", &[a(U), a(N)], None, U),
+            ("not_committed twice after unknown", &[a(U), a(N), a(N)], None, U),
+            ("first unknown", &[a(U)], None, U),
+            ("first transport", &[T], None, U),
+            ("only connect failures", &[S, S], None, N),
+            ("connect failure after unknown", &[a(U), S], None, U),
+            ("transport after connect failure", &[S, T], None, U),
+            ("transport after unknown", &[a(U), T], None, U),
+        ];
+        for (case, attempts, step, finish) in cases {
             let mut merge = Merge::default();
-            for attempt in case.previous {
-                merge.record(*attempt);
-            }
-            assert_eq!(merge.record(case.this), case.step, "{}: step", case.name);
-            assert_eq!(merge.finish(), case.finish, "{}: deadline result", case.name);
+            let steps: Vec<_> = attempts.iter().map(|attempt| merge.record(*attempt)).collect();
+            assert_eq!(steps.last(), Some(&step), "{case}: step");
+            assert_eq!(merge.finish(), finish, "{case}: deadline result");
         }
-        assert_eq!(Merge::default().finish(), Outcome::Unknown, "no attempt before the deadline");
-        for outcome in [Outcome::Committed, Outcome::NotCommitted, Outcome::Unknown] {
+        assert_eq!(Merge::default().finish(), U, "no attempt before the deadline");
+        for outcome in [C, N, U] {
             assert_eq!(parse(name(outcome)), Some(outcome), "{outcome:?} wire form");
         }
     }

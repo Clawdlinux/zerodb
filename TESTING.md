@@ -61,6 +61,23 @@ cargo test --workspace -- --ignored                # the slow checks, in debug
 The `sim` and `engine_sim` sims stay outside `tests/it` as their own test targets, so CI can call them by name.
 Debug builds skip slow filesystem tests and seeded tape schedules. The release CI step runs them.
 
+## Fault injection
+
+Wrap storage in `zerodb_tape::HookIo` (feature `sim`). Do not write a new `Io` impl, and do not add fault flags to a shared mock.
+
+```rust
+let io = Arc::new(HookIo::sim(7));                             // fresh SimDisk
+let events = io.record();                                      // mutating calls, in order
+let syncs = io.tally(|op| matches!(op, Op::SyncData(_)) as u64);
+io.fail_once(ErrorKind::StorageFull, |op| op.name() == "MANIFEST.tmp");
+io.fail_nth_sync(1, Op::is_segment);                           // fails like the disk would
+io.add(|op, next| { /* anything else */ next() });
+assert_eq!(io.open_files(), 0);
+```
+
+`io.capture()` logs each mutating call with a crash image taken right after it.
+Hooks added later run inside earlier ones. `fail_once` faults run first, so observers never see them.
+
 ## Simulations
 
 The sim commands in the [README](README.md#build-and-test) run 2,000 seeds.

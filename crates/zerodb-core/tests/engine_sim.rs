@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use zerodb_core::{
@@ -10,7 +10,7 @@ use zerodb_core::{
     Health, NewFact, NewTurn, Outcome, Role, Scope, SimFact, Turn, WindowQuery,
 };
 use zerodb_tape::sim::{CapacityError, CapacityPlan, PublishPause, SimClock, StorageFullFault};
-use zerodb_tape::{Clock, Error, FileId, Io, Kind, LockGuard, Result, SimDisk, Tape, TapeOptions};
+use zerodb_tape::{Clock, Error, HookIo, Io, Kind, Op, SimDisk, Tape, TapeOptions};
 
 struct Rng(u64);
 impl Rng {
@@ -29,126 +29,66 @@ impl Rng {
     }
 }
 
-// Capture before the caller observes its reply. Later writes cannot alter the crash image.
-struct FaultIo {
-    disk: SimDisk,
-    storage_full: StorageFullFault,
-    watch_segment_writes: AtomicBool,
-    segment_writes: AtomicUsize,
-    cut: AtomicUsize,
-    image: Mutex<Option<SimDisk>>,
-    fail_before: AtomicBool,
-    fail_after: AtomicBool,
-    checkpoint_at: AtomicUsize,
-    checkpoint: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    syncs: AtomicUsize,
-}
-impl FaultIo {
-    fn new(disk: SimDisk) -> Self {
-        Self {
-            disk,
-            storage_full: StorageFullFault::default(),
-            watch_segment_writes: AtomicBool::new(false),
-            segment_writes: AtomicUsize::new(0),
-            cut: AtomicUsize::new(0),
-            image: Mutex::new(None),
-            fail_before: AtomicBool::new(false),
-            fail_after: AtomicBool::new(false),
-            checkpoint_at: AtomicUsize::new(0),
-            checkpoint: Mutex::new(None),
-            syncs: AtomicUsize::new(0),
-        }
-    }
-    fn after<T>(&self, result: Result<T>) -> Result<T> {
-        if self.cut.load(Ordering::SeqCst) > 0 && self.cut.fetch_sub(1, Ordering::SeqCst) == 1 {
-            *self.image.lock().unwrap() = Some(self.disk.crash().unwrap());
-        }
-        if self.checkpoint_at.load(Ordering::SeqCst) > 0
-            && self.checkpoint_at.fetch_sub(1, Ordering::SeqCst) == 1
+/// Runs `f` once, right after the `n`th later mutating call. Store 0 in the result to disarm.
+/// A cut taken here precedes the caller's reply, so later writes cannot alter the image.
+fn after_nth(io: &HookIo, n: usize, f: impl FnOnce() + Send + 'static) -> Arc<AtomicUsize> {
+    let (left, f) = (Arc::new(AtomicUsize::new(n)), Mutex::new(Some(f)));
+    let count = left.clone();
+    io.add(move |op, next| {
+        let result = next();
+        if op.mutates()
+            && count.load(Ordering::SeqCst) > 0
+            && count.fetch_sub(1, Ordering::SeqCst) == 1
         {
-            let callback = self.checkpoint.lock().unwrap().take();
-            if let Some(callback) = callback {
-                callback();
-            }
+            let f = f.lock().unwrap().take();
+            f.into_iter().for_each(|f| f());
         }
         result
-    }
-    fn sync(&self, sync: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.syncs.fetch_add(1, Ordering::SeqCst);
-        if self.fail_before.swap(false, Ordering::SeqCst) {
-            self.disk.fail_next_sync()?;
-        }
-        let result = sync();
-        let result = if self.fail_after.swap(false, Ordering::SeqCst) && result.is_ok() {
-            Err(Error::SyncFailed("injected error after persistence".into()))
-        } else {
-            result
-        };
-        self.after(result)
+    });
+    left
+}
+
+/// Arms a crash image after the `n`th later mutating call. Zero never fires.
+/// The returned call disarms the cut and yields the image, if one was taken.
+fn cut_at(io: &HookIo, n: usize) -> impl FnOnce() -> Option<SimDisk> {
+    let (disk, image) = (io.inner.clone(), Arc::new(Mutex::new(None)));
+    let out = image.clone();
+    let left = after_nth(io, n, move || *out.lock().unwrap() = Some(disk.crash().unwrap()));
+    move || {
+        left.store(0, Ordering::SeqCst);
+        image.lock().unwrap().take()
     }
 }
-impl Io for FaultIo {
-    fn create(&self, p: &Path) -> Result<FileId> {
-        let file = self.after(self.disk.create(p))?;
-        self.storage_full.opened(p, file);
-        Ok(file)
-    }
-    fn open(&self, p: &Path) -> Result<FileId> {
-        let file = self.disk.open(p)?;
-        self.storage_full.opened(p, file);
-        Ok(file)
-    }
-    fn close(&self, f: FileId) -> Result<()> {
-        self.storage_full.closed(f);
-        self.disk.close(f)
-    }
-    fn write_at(&self, f: FileId, o: u64, b: &[u8]) -> Result<()> {
-        if self.watch_segment_writes.load(Ordering::SeqCst) && self.storage_full.is_segment(f) {
-            self.segment_writes.fetch_add(1, Ordering::SeqCst);
+
+/// Fails the next sync once: before it reaches the disk, or `after` it persisted.
+/// Store 0 in the result to disarm.
+fn fail_sync(io: &HookIo, after: bool) -> Arc<AtomicUsize> {
+    let (armed, disk) = (Arc::new(AtomicUsize::new(1)), io.inner.clone());
+    let left = armed.clone();
+    io.add(move |op, next| {
+        if !op.is_sync() {
+            return next();
         }
-        self.storage_full.before_write(&self.disk, f, b.len());
-        self.after(self.disk.write_at(f, o, b))
-    }
-    fn read_at(&self, f: FileId, o: u64, b: &mut [u8]) -> Result<usize> {
-        self.disk.read_at(f, o, b)
-    }
-    fn len(&self, f: FileId) -> Result<u64> {
-        self.disk.len(f)
-    }
-    fn set_len(&self, f: FileId, n: u64) -> Result<()> {
-        self.after(self.disk.set_len(f, n))
-    }
-    fn allocate(&self, f: FileId, n: u64) -> Result<()> {
-        self.after(self.disk.allocate(f, n))
-    }
-    fn available_bytes(&self, dir: &Path) -> Result<u64> {
-        self.disk.available_bytes(dir)
-    }
-    fn total_bytes(&self, dir: &Path) -> Result<u64> {
-        self.disk.total_bytes(dir)
-    }
-    fn sync_data(&self, f: FileId) -> Result<()> {
-        self.storage_full.before_sync(&self.disk, f);
-        self.sync(|| self.disk.sync_data(f))
-    }
-    fn sync_dir(&self, p: &Path) -> Result<()> {
-        self.sync(|| self.disk.sync_dir(p))
-    }
-    fn rename(&self, a: &Path, b: &Path) -> Result<()> {
-        self.after(self.disk.rename(a, b))
-    }
-    fn remove(&self, p: &Path) -> Result<()> {
-        self.after(self.disk.remove(p))
-    }
-    fn list(&self, p: &Path) -> Result<Vec<PathBuf>> {
-        self.disk.list(p)
-    }
-    fn exists(&self, p: &Path) -> Result<bool> {
-        self.disk.exists(p)
-    }
-    fn try_lock_exclusive(&self, p: &Path) -> Result<LockGuard> {
-        self.disk.try_lock_exclusive(p)
-    }
+        if !after && left.swap(0, Ordering::SeqCst) == 1 {
+            disk.fail_next_sync()?;
+        }
+        let result = next();
+        if after && left.swap(0, Ordering::SeqCst) == 1 && result.is_ok() {
+            return Err(Error::SyncFailed("injected error after persistence".into()));
+        }
+        result
+    });
+    armed
+}
+
+/// Arms the plan's `StorageFull` on the next data-segment write or sync.
+fn storage_full(io: &HookIo, plan: &CapacityPlan) {
+    let (fault, disk) = (StorageFullFault::default(), io.inner.clone());
+    fault.arm(plan);
+    io.add(move |op, next| {
+        fault.before(&disk, &op);
+        next()
+    });
 }
 
 #[derive(Clone)]
@@ -464,7 +404,7 @@ fn assert_deduplicated(original: &Appended, retried: &Appended) {
     assert_eq!(*original, Appended { deduplicated: false, ..retried.clone() });
 }
 
-fn open(io: Arc<FaultIo>, clock: Arc<SimClock>, opts: &EngineOptions) -> Engine {
+fn open(io: Arc<dyn Io>, clock: Arc<SimClock>, opts: &EngineOptions) -> Engine {
     Engine::open_with(io, clock, "db", opts.clone()).unwrap()
 }
 
@@ -643,7 +583,7 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
         ..EngineOptions::default()
     };
     let clock = Arc::new(SimClock::default());
-    let mut io = Arc::new(FaultIo::new(SimDisk::new(seed)));
+    let mut io = Arc::new(HookIo::sim(seed));
     let mut engine = open(io.clone(), clock.clone(), &opts);
     let mut oracle = Oracle::new();
     oracle.fact_history = opts.fact_history;
@@ -671,24 +611,16 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
             oracle.batches.push(batch);
             // Every seed covers failed sync before and after persistence, plus live reopen.
             let fault = step == 12 || step == 28;
-            if fault {
-                if step == 12 {
-                    io.fail_before.store(true, Ordering::SeqCst);
-                } else {
-                    io.fail_after.store(true, Ordering::SeqCst);
-                }
-            }
+            let failing = fault.then(|| fail_sync(&io, step == 28));
             let cut = step == 39;
-            if cut {
-                io.cut.store(1 + rng.below(6), Ordering::SeqCst);
-            }
+            let take = cut.then(|| cut_at(&io, 1 + rng.below(6)));
             let result = write(&engine, &oracle, index, false);
-            let image = io.image.lock().unwrap().take();
+            let image = take.and_then(|take| take());
             if image.is_some() {
                 if let Ok(receipt) = &result {
                     let mut after_ack = oracle.clone();
                     after_ack.apply(index, receipt.clone());
-                    after_ack.recover(&io.disk.crash().unwrap(), clock.clone(), &opts, &[]);
+                    after_ack.recover(&io.inner.crash().unwrap(), clock.clone(), &opts, &[]);
                 }
             }
             let mut pending = Vec::new();
@@ -714,20 +646,18 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
                 }
             }
             if fault || cut {
-                io.cut.store(0, Ordering::SeqCst);
-                io.fail_before.store(false, Ordering::SeqCst);
-                io.fail_after.store(false, Ordering::SeqCst);
+                failing.iter().for_each(|armed| armed.store(0, Ordering::SeqCst));
                 // A captured image excludes graceful shutdown, unlike live reopen.
                 let next = image.unwrap_or_else(|| {
                     if cut {
-                        io.disk.crash().unwrap()
+                        io.inner.crash().unwrap()
                     } else {
-                        io.disk.clone()
+                        io.inner.clone()
                     }
                 });
                 drop(engine);
                 oracle.recover(&next, clock.clone(), &opts, &pending);
-                io = Arc::new(FaultIo::new(next));
+                io = Arc::new(HookIo::new(next));
                 engine = open(io.clone(), clock.clone(), &opts);
                 oracle.verify(&engine, &mut rng);
                 // Unknown retries must either return the original receipt or install exactly once.
@@ -756,20 +686,19 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
             assert!(engine.metrics().unwrap().hot_page_bytes <= opts.hot_page_bytes);
         }
         // Cut checkpoint installation independently from append, including directory persistence.
-        io.cut.store(1 + rng.below(14), Ordering::SeqCst);
+        let take = cut_at(&io, 1 + rng.below(14));
         engine.checkpoint().unwrap();
-        io.cut.store(0, Ordering::SeqCst);
-        let next = io.image.lock().unwrap().take().unwrap_or_else(|| io.disk.crash().unwrap());
+        let next = take().unwrap_or_else(|| io.inner.crash().unwrap());
         drop(engine);
         oracle.recover(&next, clock.clone(), &opts, &[]);
-        io = Arc::new(FaultIo::new(next));
+        io = Arc::new(HookIo::new(next));
         engine = open(io.clone(), clock.clone(), &opts);
         oracle.verify(&engine, &mut rng);
         engine.checkpoint().unwrap();
         drop(engine);
         // Checkpoints are derived data. Corrupt a referenced file and demand full replay.
-        corrupt_page_checksum(&io.disk, &mut rng);
-        let records = oracle.recover(&io.disk, clock.clone(), &opts, &[]);
+        corrupt_page_checksum(&io.inner, &mut rng);
+        let records = oracle.recover(&io.inner, clock.clone(), &opts, &[]);
         engine = open(io.clone(), clock.clone(), &opts);
         let metrics = engine.metrics().unwrap();
         assert!(metrics.checkpoint_warnings > 0, "generation={generation}");
@@ -812,7 +741,7 @@ fn enqueue_keyed_batch<'a>(
 
 fn capacity_faults(
     engine: Arc<Engine>,
-    io: &mut Arc<FaultIo>,
+    io: &mut Arc<HookIo>,
     clock: &Arc<SimClock>,
     opts: &EngineOptions,
     oracle: &mut Oracle,
@@ -844,12 +773,10 @@ fn capacity_faults(
         queued.push(reply);
         indices.push(index);
     }
-    plan.limit(&io.disk);
-    io.segment_writes.store(0, Ordering::SeqCst);
-    io.watch_segment_writes.store(true, Ordering::SeqCst);
+    plan.limit(&io.inner);
+    let segment_writes = io.tally(|op| (matches!(op, Op::Write(..)) && op.is_segment()) as u64);
     engine.step_sim().unwrap();
-    io.watch_segment_writes.store(false, Ordering::SeqCst);
-    assert_eq!(io.segment_writes.load(Ordering::SeqCst), 0, "a floor rejection wrote to a segment");
+    assert_eq!(segment_writes.load(Ordering::SeqCst), 0, "a floor rejection wrote to a segment");
     for reply in queued {
         let error = reply().unwrap_err();
         assert!(matches!(error.kind, ErrorKind::Storage(Error::DiskFull)));
@@ -863,9 +790,9 @@ fn capacity_faults(
         .filter_map(|(scope, turns)| turns.first().map(|turn| (scope, turn)))
         .min_by_key(|(_, turn)| turn.lsn)
         .unwrap();
-    let capacity = io.disk.total_bytes(Path::new("db")).unwrap();
-    let free = io.disk.available_bytes(Path::new("db")).unwrap();
-    io.disk.set_capacity(capacity - free).unwrap();
+    let capacity = io.inner.total_bytes(Path::new("db")).unwrap();
+    let free = io.inner.available_bytes(Path::new("db")).unwrap();
+    io.inner.set_capacity(capacity - free).unwrap();
     let reloads = engine.metrics().unwrap().tape_index.page_reloads;
     assert_eq!(
         engine
@@ -883,9 +810,9 @@ fn capacity_faults(
     for key in oracle.facts.keys() {
         oracle.check_fact(&engine, key);
     }
-    assert_eq!(io.disk.available_bytes(Path::new("db")).unwrap(), 0);
+    assert_eq!(io.inner.available_bytes(Path::new("db")).unwrap(), 0);
     assert_eq!(engine.health(), Health::ReadOnly, "cold reads must not clear read-only");
-    io.disk.set_capacity(capacity).unwrap();
+    io.inner.set_capacity(capacity).unwrap();
     if let Some(index) =
         oracle.batches.iter().position(|batch| batch.receipt.is_some() && batch.key.is_some())
     {
@@ -898,7 +825,7 @@ fn capacity_faults(
         "a floor hit changed engine state or dedup"
     );
 
-    plan.free(&io.disk);
+    plan.free(&io.inner);
     let mut lsn = before.0;
     for index in indices {
         retry(&engine, oracle, index);
@@ -926,13 +853,13 @@ fn capacity_faults(
     for _ in 0..2 + rng.below(3) {
         queued.push(enqueue_keyed_batch(&engine, oracle, rng, clock));
     }
-    io.storage_full.arm(plan);
-    io.cut.store(plan.cut, Ordering::SeqCst);
-    let full_before = io.disk.storage_full_returns().unwrap();
+    storage_full(io, plan);
+    let take = cut_at(io, plan.cut);
+    let full_before = io.inner.storage_full_returns().unwrap();
     engine.step_sim().unwrap();
     assert_eq!(engine.health(), Health::Poisoned, "post-prepare StorageFull must poison");
-    assert_eq!(io.disk.storage_full_returns().unwrap() - full_before, 1);
-    let image = io.image.lock().unwrap().take();
+    assert_eq!(io.inner.storage_full_returns().unwrap() - full_before, 1);
+    let image = take();
     let mut pending = Vec::new();
     let mut post_return_pending = Vec::new();
     for (position, (index, reply)) in queued.into_iter().enumerate() {
@@ -954,8 +881,7 @@ fn capacity_faults(
             pending.push(index);
         }
     }
-    io.cut.store(0, Ordering::SeqCst);
-    let crashed = io.disk.crash().unwrap();
+    let crashed = io.inner.crash().unwrap();
     drop(engine);
     if image.is_some() {
         oracle.clone().recover(&crashed, clock.clone(), opts, &post_return_pending);
@@ -963,7 +889,7 @@ fn capacity_faults(
     let next = image.unwrap_or(crashed);
     oracle.recover(&next, clock.clone(), opts, &pending);
     next.set_capacity(SimDisk::DEFAULT_CAPACITY).unwrap();
-    *io = Arc::new(FaultIo::new(next));
+    *io = Arc::new(HookIo::new(next));
     let engine = Arc::new(open(io.clone(), clock.clone(), opts));
     assert_eq!(engine.health(), Health::Ok);
     oracle.verify(&engine, rng);
@@ -993,7 +919,7 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
         ..EngineOptions::default()
     };
     let clock = Arc::new(SimClock::default());
-    let mut io = Arc::new(FaultIo::new(SimDisk::new(seed)));
+    let mut io = Arc::new(HookIo::sim(seed));
     let mut engine = Arc::new(open(io.clone(), clock.clone(), &opts));
     let mut oracle = Oracle::new();
     for scope in 0..4 {
@@ -1023,7 +949,7 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
             };
             let clock = Arc::new(SimClock::new(1000));
             let engine = Engine::open_with(disk.clone(), clock, "db", opts.clone()).unwrap();
-            let scope = Scope { tenant: "t".into(), agent: "a".into(), session: "s".into() };
+            let scope = one_scope();
             for index in 0..if proof { 3 } else { 1 } {
                 engine
                     .append(
@@ -1108,10 +1034,16 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
                 && !cut
                 && rng.below(2) == 0
                 && metrics.durable_lsn > metrics.checkpoint_watermark;
-            if !fault && !cut {
+            let mut take = None;
+            let armed = if fault {
+                Some(fail_sync(&io, generation % 2 == 1))
+            } else if cut {
+                take = Some(cut_at(&io, 1 + rng.below(4)));
+                None
+            } else {
                 let weak = Arc::downgrade(&engine);
                 let fired = checkpoint_fired.clone();
-                *io.checkpoint.lock().unwrap() = Some(Box::new(move || {
+                let checkpoint = move || {
                     let engine = weak.upgrade().unwrap();
                     if writer_in_checkpoint {
                         engine.step_sim().unwrap();
@@ -1120,7 +1052,7 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
                         assert_eq!(engine.checkpoint().unwrap(), boundary);
                     }
                     fired.store(true, Ordering::SeqCst);
-                }));
+                };
                 // A conditional fact can conflict and write nothing.
                 let conditional = queued
                     .iter()
@@ -1128,16 +1060,8 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
                         oracle.batches[*i].fact.as_ref().is_some_and(|f| f.if_lsn.is_some())
                     })
                     .count();
-                io.checkpoint_at.store(1 + rng.below(count - conditional), Ordering::SeqCst);
-            } else if fault {
-                if generation % 2 == 0 {
-                    io.fail_before.store(true, Ordering::SeqCst);
-                } else {
-                    io.fail_after.store(true, Ordering::SeqCst);
-                }
-            } else {
-                io.cut.store(1 + rng.below(4), Ordering::SeqCst);
-            }
+                Some(after_nth(&io, 1 + rng.below(count - conditional), checkpoint))
+            };
             if writer_in_checkpoint {
                 assert_eq!(engine.checkpoint().unwrap(), boundary);
                 assert!(engine.metrics().unwrap().durable_lsn > boundary);
@@ -1151,12 +1075,8 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
             if !fault && !cut {
                 assert!(checkpoint_fired.load(Ordering::SeqCst));
             }
-            io.checkpoint_at.store(0, Ordering::SeqCst);
-            io.checkpoint.lock().unwrap().take();
-            io.cut.store(0, Ordering::SeqCst);
-            io.fail_before.store(false, Ordering::SeqCst);
-            io.fail_after.store(false, Ordering::SeqCst);
-            let image = io.image.lock().unwrap().take();
+            armed.iter().for_each(|armed| armed.store(0, Ordering::SeqCst));
+            let image = take.and_then(|take| take());
             if image.is_some() {
                 let mut after_ack = oracle.clone();
                 let mut uncertain = Vec::new();
@@ -1175,7 +1095,7 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
                     }
                 }
                 // Acknowledgements after the earlier cut must survive a later, post-return crash.
-                after_ack.recover(&io.disk.crash().unwrap(), clock.clone(), &opts, &uncertain);
+                after_ack.recover(&io.inner.crash().unwrap(), clock.clone(), &opts, &uncertain);
             }
             let mut pending = Vec::new();
             for (index, conflict, result) in results {
@@ -1210,14 +1130,14 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
             if fault || cut {
                 let next = image.unwrap_or_else(|| {
                     if cut {
-                        io.disk.crash().unwrap()
+                        io.inner.crash().unwrap()
                     } else {
-                        io.disk.clone()
+                        io.inner.clone()
                     }
                 });
                 drop(engine);
                 oracle.recover(&next, clock.clone(), &opts, &pending);
-                io = Arc::new(FaultIo::new(next));
+                io = Arc::new(HookIo::new(next));
                 engine = Arc::new(open(io.clone(), clock.clone(), &opts));
                 oracle.verify(&engine, &mut rng);
                 for index in pending {
@@ -1236,7 +1156,7 @@ fn grouped_seed(seed: u64, plan: &CapacityPlan) -> Vec<Vec<Turn>> {
 
 #[test]
 fn inline_group_publishes_once_and_replies_with_original_sequences() {
-    let io = Arc::new(FaultIo::new(SimDisk::new(19)));
+    let io = Arc::new(HookIo::sim(19));
     let pause = Arc::new(PublishPause::default());
     let opts = EngineOptions {
         tape: TapeOptions {
@@ -1248,11 +1168,10 @@ fn inline_group_publishes_once_and_replies_with_original_sequences() {
         ..EngineOptions::default()
     };
     let engine = open(io.clone(), Arc::new(SimClock::default()), &opts);
-    let scope = Scope { tenant: "t".into(), agent: "a".into(), session: "s".into() };
-    let turn = NewTurn { role: Role::User, content: vec![1], meta: vec![] };
+    let (scope, turn) = (one_scope(), NewTurn { role: Role::User, content: vec![1], meta: vec![] });
     engine.append(&scope, vec![turn.clone()], None).unwrap();
     let before = engine.metrics().unwrap();
-    let syncs = io.syncs.load(Ordering::SeqCst);
+    let syncs = io.tally(|op| op.is_sync() as u64);
     let first = engine.enqueue_sim(&scope, vec![turn.clone()], Some("same-group")).unwrap();
     let duplicate = engine.enqueue_sim(&scope, vec![turn.clone()], Some("same-group")).unwrap();
     let keyless = engine.enqueue_sim(&scope, vec![turn.clone()], None).unwrap();
@@ -1298,7 +1217,7 @@ fn inline_group_publishes_once_and_replies_with_original_sequences() {
     assert_deduplicated(&first, &retried);
     assert_deduplicated(&first, &duplicate.finish().unwrap());
     assert_eq!(keyless.finish().unwrap().seqs, vec![3]);
-    assert_eq!(io.syncs.load(Ordering::SeqCst) - syncs, 1);
+    assert_eq!(syncs.load(Ordering::SeqCst), 1);
     let after = engine.metrics().unwrap();
     assert_eq!(after.writer_groups - before.writer_groups, 2);
     assert_eq!(after.writer_group_requests - before.writer_group_requests, 4);
@@ -1361,15 +1280,19 @@ fn inline_group_publishes_once_and_replies_with_original_sequences() {
     assert_eq!(engine.fact_get("t", "k").unwrap().unwrap().lsn, k3.lsn);
 }
 
+fn inline_opts() -> EngineOptions {
+    let tape = TapeOptions { segment_size: 64 * 1024, inline_sim: true, ..TapeOptions::default() };
+    EngineOptions { tape, ..EngineOptions::default() }
+}
+
+fn one_scope() -> Scope {
+    Scope { tenant: "t".into(), agent: "a".into(), session: "s".into() }
+}
+
 #[test]
 fn fact_groups_keep_retained_pointers_bounded() {
-    let io = Arc::new(FaultIo::new(SimDisk::new(37)));
-    let clock = Arc::new(SimClock::default());
-    let opts = EngineOptions {
-        tape: TapeOptions { segment_size: 64 * 1024, inline_sim: true, ..TapeOptions::default() },
-        fact_history: 1,
-        ..EngineOptions::default()
-    };
+    let (io, clock) = (Arc::new(SimDisk::new(37)), Arc::new(SimClock::default()));
+    let opts = EngineOptions { fact_history: 1, ..inline_opts() };
     let engine = open(io.clone(), clock.clone(), &opts);
     let fact = |key: String| NewFact { key, content: vec![1], meta: vec![], agent: "a".into() };
     engine.fact_put("t", fact("hot".into()), None, None).unwrap();
@@ -1395,14 +1318,10 @@ fn fact_groups_keep_retained_pointers_bounded() {
 
 #[test]
 fn publish_during_checkpoint_keeps_the_new_page_dirty() {
-    let io = Arc::new(FaultIo::new(SimDisk::new(31)));
-    let clock = Arc::new(SimClock::default());
-    let opts = EngineOptions {
-        tape: TapeOptions { segment_size: 64 * 1024, inline_sim: true, ..TapeOptions::default() },
-        ..EngineOptions::default()
-    };
+    let (io, clock, opts) =
+        (Arc::new(HookIo::sim(31)), Arc::new(SimClock::default()), inline_opts());
     let engine = Arc::new(open(io.clone(), clock.clone(), &opts));
-    let scope = Scope { tenant: "t".into(), agent: "a".into(), session: "s".into() };
+    let scope = one_scope();
     let turn = |value| NewTurn { role: Role::User, content: vec![value], meta: vec![] };
     engine.append(&scope, vec![turn(1), turn(2)], None).unwrap();
     let fact =
@@ -1411,14 +1330,12 @@ fn publish_during_checkpoint_keeps_the_new_page_dirty() {
     let queued = engine.enqueue_sim(&scope, vec![turn(3)], None).unwrap();
     // A write to a key the snapshot holds, published before the install.
     let later = engine.enqueue_fact_sim("t", fact(2), false, None, None).unwrap();
-    let weak = Arc::downgrade(&engine);
-    let fired = Arc::new(AtomicBool::new(false));
+    let (weak, fired) = (Arc::downgrade(&engine), Arc::new(AtomicBool::new(false)));
     let completed = fired.clone();
-    *io.checkpoint.lock().unwrap() = Some(Box::new(move || {
+    after_nth(&io, 2, move || {
         weak.upgrade().unwrap().step_sim().unwrap();
         completed.store(true, Ordering::SeqCst);
-    }));
-    io.checkpoint_at.store(2, Ordering::SeqCst);
+    });
     assert_eq!(engine.checkpoint().unwrap(), first.lsn);
     assert!(fired.load(Ordering::SeqCst));
     let receipt = queued.finish().unwrap();
@@ -1426,7 +1343,7 @@ fn publish_during_checkpoint_keeps_the_new_page_dirty() {
     let later = later.finish().unwrap();
     assert_eq!(engine.checkpoint().unwrap(), later.lsn);
     drop(engine);
-    let engine = open(Arc::new(FaultIo::new(io.disk.crash().unwrap())), clock, &opts);
+    let engine = open(Arc::new(io.inner.crash().unwrap()), clock, &opts);
     let value = engine.fact_get("t", "k").unwrap().map(|fact| fact.lsn);
     assert_eq!(value, Some(later.lsn), "the key stayed dirty, so the next checkpoint wrote it");
     let window = engine.window(&scope, WindowQuery::Last(10)).unwrap();
@@ -1440,34 +1357,28 @@ fn publish_during_checkpoint_keeps_the_new_page_dirty() {
 
 #[test]
 fn legacy_checkpoint_magic_falls_back_to_full_replay() {
-    let io = Arc::new(FaultIo::new(SimDisk::new(33)));
-    let clock = Arc::new(SimClock::default());
-    let opts = EngineOptions {
-        tape: TapeOptions { segment_size: 64 * 1024, inline_sim: true, ..TapeOptions::default() },
-        ..EngineOptions::default()
-    };
-    let scope = Scope { tenant: "t".into(), agent: "a".into(), session: "s".into() };
-    let turn = NewTurn { role: Role::User, content: vec![7], meta: vec![] };
+    let (io, clock, opts) =
+        (Arc::new(SimDisk::new(33)), Arc::new(SimClock::default()), inline_opts());
+    let (scope, turn) = (one_scope(), NewTurn { role: Role::User, content: vec![7], meta: vec![] });
     let engine = open(io.clone(), clock.clone(), &opts);
     engine.append(&scope, vec![turn.clone(); 2], Some("original")).unwrap();
     engine.checkpoint().unwrap();
     drop(engine);
     let path = io
-        .disk
         .list(Path::new("db"))
         .unwrap()
         .into_iter()
         .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with("ckpt-"))
         .unwrap();
-    let file = io.disk.open(&path).unwrap();
+    let file = io.open(&path).unwrap();
     let mut header = [0; 28];
-    assert_eq!(io.disk.read_at(file, 0, &mut header).unwrap(), header.len());
+    assert_eq!(io.read_at(file, 0, &mut header).unwrap(), header.len());
     header[8..12].copy_from_slice(b"ZCK1");
     let crc = zerodb_tape::sim::crc32c(&header[4..]);
     header[..4].copy_from_slice(&crc.to_le_bytes());
-    io.disk.write_at(file, 0, &header).unwrap();
-    io.disk.sync_data(file).unwrap();
-    io.disk.close(file).unwrap();
+    io.write_at(file, 0, &header).unwrap();
+    io.sync_data(file).unwrap();
+    io.close(file).unwrap();
     let engine = open(io, clock, &opts);
     assert_eq!(engine.metrics().unwrap().checkpoint_warnings, 1);
     assert_eq!(engine.metrics().unwrap().replayed_records, 3);
@@ -1477,23 +1388,19 @@ fn legacy_checkpoint_magic_falls_back_to_full_replay() {
 
 #[test]
 fn missing_checkpoint_filename_after_crash_replays_the_tape() {
-    let opts = EngineOptions {
-        tape: TapeOptions { segment_size: 64 * 1024, inline_sim: true, ..TapeOptions::default() },
-        ..EngineOptions::default()
-    };
-    let scope = Scope { tenant: "t".into(), agent: "a".into(), session: "s".into() };
+    let (opts, scope) = (inline_opts(), one_scope());
     let turn = NewTurn { role: Role::User, content: vec![9], meta: vec![] };
     let mut observed = false;
     for seed in 0..128 {
         eprintln!("case: seed={seed}");
-        let io = Arc::new(FaultIo::new(SimDisk::new(seed)));
+        let io = Arc::new(HookIo::sim(seed));
         let clock = Arc::new(SimClock::default());
         let engine = open(io.clone(), clock.clone(), &opts);
         let receipt = engine.append(&scope, vec![turn.clone(); 2], None).unwrap();
         // Capture after manifest rename, before the sole checkpoint directory sync.
-        io.cut.store(7, Ordering::SeqCst);
+        let take = cut_at(&io, 7);
         engine.checkpoint().unwrap();
-        let image = io.image.lock().unwrap().take().unwrap();
+        let image = take().unwrap();
         drop(engine);
         if image.exists(Path::new("db/CHECKPOINT")).unwrap()
             && !image

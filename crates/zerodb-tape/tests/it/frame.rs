@@ -52,7 +52,6 @@ fn fixed_header_layout_is_little_endian() {
     assert_eq!(bytes.len(), HEADER_LEN + original.payload.len());
     assert_eq!(decode(&bytes).unwrap().0, original);
     for (case, segment, offset) in [("different segment", 8, 128), ("different offset", 7, 129)] {
-        eprintln!("case: {case}");
         assert_eq!(frame::decode(&bytes, segment, offset), Err(DecodeError::BadCrc), "{case}");
     }
 }
@@ -70,7 +69,6 @@ fn footer_layout_and_payload_lengths_follow_the_wire_contract() {
     assert_eq!(&payload[28..], &0x12345678u32.to_le_bytes());
     assert_eq!(Footer::decode(&payload).unwrap(), footer);
     for (case, len) in [("short footer", 31), ("long footer", 33)] {
-        eprintln!("case: {case}");
         assert!(Footer::decode(&vec![0; len]).is_err(), "{case}");
     }
 }
@@ -78,12 +76,13 @@ fn footer_layout_and_payload_lengths_follow_the_wire_contract() {
 #[test]
 fn every_single_bit_flip_is_detected() {
     for content_len in [7, 8, 88] {
-        eprintln!("case: content_len={content_len:?}");
         let encoded = encode(&frame(Kind::Turn, &vec![3; content_len])).unwrap();
         for bit in 0..encoded.len() * 8 {
             let mut damaged = encoded.clone();
             damaged[bit / 8] ^= 1 << (bit % 8);
-            assert!(matches!(decode(&damaged), Err(DecodeError::BadCrc | DecodeError::BadLength)));
+            let detected =
+                matches!(decode(&damaged), Err(DecodeError::BadCrc | DecodeError::BadLength));
+            assert!(detected, "content_len={content_len}, bit={bit}");
         }
     }
 }
@@ -108,16 +107,22 @@ fn boundaries_versions_and_end_marker() {
     assert_eq!(decode(&bytes), Err(DecodeError::UnknownVersion));
     bytes[9] = VERSION;
     for kind in [0, 4, 7, 99] {
-        eprintln!("case: kind={kind:?}");
         bytes[8] = kind;
         refresh_crc(&mut bytes);
-        assert_eq!(decode(&bytes), Err(DecodeError::BadLength));
+        assert_eq!(decode(&bytes), Err(DecodeError::BadLength), "kind={kind}");
     }
     let bytes = encode(&original).unwrap();
     assert_eq!(decode(&bytes[..bytes.len() - 1]), Err(DecodeError::BadLength));
     let mut concatenated = bytes.clone();
     concatenated.extend_from_slice(&bytes);
     assert_eq!(decode(&concatenated).unwrap(), (original, bytes.len()));
+    // A version 1 frame with the legacy unbound checksum reports an unsupported format.
+    let mut legacy = vec![0; 120];
+    legacy[4..8].copy_from_slice(&120u32.to_le_bytes());
+    legacy[8..10].copy_from_slice(&[1, 1]);
+    let crc = zerodb_tape::sim::crc32c(&legacy[4..]);
+    legacy[..4].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(frame::decode(&legacy, 1, 0), Err(DecodeError::UnknownVersion));
 }
 
 #[test]
@@ -137,21 +142,6 @@ fn maximum_frame_size_and_invalid_metadata_are_enforced() {
     invalid.header.flags = 0;
     invalid.header.version = 1;
     assert!(matches!(encode(&invalid), Err(Error::InvalidFrame(_))));
-}
-
-mod wire {
-    use zerodb_tape::sim::frame::{self, DecodeError};
-
-    #[test]
-    fn legacy_checksum_reports_an_unsupported_format() {
-        let mut bytes = vec![0; 120];
-        bytes[4..8].copy_from_slice(&120u32.to_le_bytes());
-        bytes[8] = 1;
-        bytes[9] = 1;
-        let crc = zerodb_tape::sim::crc32c(&bytes[4..]);
-        bytes[..4].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(frame::decode(&bytes, 1, 0), Err(DecodeError::UnknownVersion));
-    }
 }
 
 mod checksum {

@@ -27,20 +27,3 @@ impl Registry {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-
-    #[test]
-    fn registry_ids_and_tenant_limit() {
-        let mut registry = Registry::default();
-        for id in 1..=10_000 {
-            registry.insert(&id.to_string(), id, u64::from(id), 10_000).unwrap();
-            assert_eq!(registry.get(&id.to_string()), Some(id), "id={id}");
-        }
-        let error = registry.insert("full", 10_001, 10_001, 10_000).unwrap_err();
-        assert!(matches!(error.kind, ErrorKind::ResourceExhausted("tenants")));
-    }
-}

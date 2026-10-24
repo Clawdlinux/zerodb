@@ -1,16 +1,14 @@
-use crate::support;
-use crate::support::facts::{new_fact, query};
-use crate::support::sessions::*;
-use crate::support::TestDir;
+use crate::support::*;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 use zerodb_core::{
-    Appended, Engine, EngineOptions, ErrorKind, Health, NewTurn, Outcome, WindowQuery,
+    Appended, Engine, EngineOptions, ErrorKind, Health, NewTurn, Outcome, Scope, WindowQuery,
 };
 use zerodb_tape::sim::SimClock;
-use zerodb_tape::{Io, Kind, SimDisk, Tape};
+use zerodb_tape::{HookIo, Io, Kind, Op, SimDisk, Tape, TapeOptions};
 
 #[test]
 fn windows_are_dense_and_read_cost_depends_only_on_returned_turns() {
@@ -50,7 +48,7 @@ fn windows_are_dense_and_read_cost_depends_only_on_returned_turns() {
         );
     }
     // Byte budgets count content plus meta. Every turn in "s" costs 8 bytes, in "meta" 16.
-    let meta = support::sessions::scope("meta");
+    let meta = crate::support::scope("meta");
     let turns = (1..=3).map(|value| NewTurn { meta: vec![0; 8], ..turn(value) }).collect();
     engine.append(&meta, turns, None).unwrap();
     for (case, scope, query, max_bytes, seqs, truncated) in [
@@ -126,54 +124,40 @@ fn retries_conflicts_scope_isolation_and_replay() {
 
 #[test]
 fn tenant_ids_survive_reopen_and_limit_is_typed() {
-    for (case, limit) in [("configured tenant limit", 2)] {
-        eprintln!("case: {case}");
-        let disk = Arc::new(SimDisk::new(3));
-        let opts = EngineOptions { max_tenants: limit, ..options() };
-        let engine = open(disk.clone(), opts.clone());
-        let mut scopes = Vec::new();
-        for id in 1..=limit {
-            let mut tenant = scope("s");
-            if id > 1 {
-                tenant.tenant = format!("tenant-{id}");
-            }
-            let receipt = engine.append(&tenant, vec![turn(id as u64)], None).unwrap();
-            assert_eq!(receipt.seqs, vec![1], "{case}, tenant={id}");
-            scopes.push(tenant);
-        }
-        for (index, tenant) in scopes.iter().enumerate() {
-            let window = engine.window(tenant, WindowQuery::Last(1)).unwrap();
-            assert_eq!(
-                window[0].content,
-                (index as u64 + 1).to_le_bytes(),
-                "{case}, tenant={index}"
-            );
-        }
-        let mut overflow = scope("s");
-        overflow.tenant = "overflow".into();
-        let error = engine.append(&overflow, vec![turn(1)], None).unwrap_err();
-        assert!(matches!(error.kind, ErrorKind::ResourceExhausted("tenants")), "{case}");
-        assert_eq!(error.outcome, Outcome::NotCommitted, "{case}");
-        drop(engine);
-        let (tape, _) =
-            Tape::open(disk.clone(), Arc::new(SimClock::default()), "db", opts.tape.clone())
-                .unwrap();
-        let creates: Vec<_> = tape
-            .scan(0)
-            .map(|record| record.unwrap())
-            .filter(|record| record.kind == Kind::TenantCreate)
-            .collect();
-        assert_eq!(creates.len(), limit, "{case}");
-        for (index, record) in creates.iter().enumerate() {
-            assert_eq!(record.tenant_id as usize, index + 1, "{case}, tenant={index}");
-        }
-        assert_eq!(creates[0].payload.as_ref(), b"tenant", "{case}");
-        drop(tape);
-        let engine = open(disk.clone(), opts.clone());
-        engine.append(&scope("s"), vec![turn(2)], None).unwrap();
-        assert_eq!(engine.window(&scope("s"), WindowQuery::Last(2)).unwrap().len(), 2, "{case}");
-        assert_eq!(engine.metrics().unwrap().tenants, limit, "{case}");
+    let (disk, limit) = (Arc::new(SimDisk::new(3)), 2);
+    let opts = EngineOptions { max_tenants: limit, ..options() };
+    let engine = open(disk.clone(), opts.clone());
+    let tenant = |id: usize| Scope { tenant: format!("tenant-{id}"), ..scope("s") };
+    let scopes: Vec<_> =
+        (1..=limit).map(|id| if id == 1 { scope("s") } else { tenant(id) }).collect();
+    for (index, scope) in scopes.iter().enumerate() {
+        let receipt = engine.append(scope, vec![turn(index as u64 + 1)], None).unwrap();
+        assert_eq!(receipt.seqs, vec![1], "tenant={index}");
     }
+    for (index, scope) in scopes.iter().enumerate() {
+        let window = engine.window(scope, WindowQuery::Last(1)).unwrap();
+        assert_eq!(window[0].content, (index as u64 + 1).to_le_bytes(), "tenant={index}");
+    }
+    let error = engine.append(&tenant(limit + 1), vec![turn(1)], None).unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::ResourceExhausted("tenants")), "{error}");
+    assert_eq!(error.outcome, Outcome::NotCommitted);
+    drop(engine);
+    let (tape, _) =
+        Tape::open(disk.clone(), Arc::new(SimClock::default()), "db", opts.tape.clone()).unwrap();
+    let creates: Vec<_> =
+        tape.scan(0).map(Result::unwrap).filter(|r| r.kind == Kind::TenantCreate).collect();
+    let ids: Vec<_> = creates.iter().map(|record| record.tenant_id as usize).collect();
+    assert_eq!(ids, (1..=limit).collect::<Vec<_>>(), "ids are dense and logged in order");
+    assert_eq!(creates[0].payload.as_ref(), b"tenant");
+    drop(tape);
+    let lowered = EngineOptions { max_tenants: limit - 1, ..opts.clone() };
+    let clock = Arc::new(SimClock::default());
+    let error = Engine::open_with(disk.clone(), clock, "db", lowered).unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::ResourceExhausted("tenants")), "lowered: {error}");
+    let engine = open(disk, opts);
+    engine.append(&scope("s"), vec![turn(2)], None).unwrap();
+    assert_eq!(engine.window(&scope("s"), WindowQuery::Last(2)).unwrap().len(), 2);
+    assert_eq!(engine.metrics().unwrap().tenants, limit);
 }
 
 #[test]
@@ -292,31 +276,46 @@ fn checkpoint_bounds_replay_and_corrupt_derived_data_falls_back() {
 }
 
 #[test]
-fn hot_page_budget_evicts_and_reloads_cold_sessions() {
-    let disk = Arc::new(SimDisk::new(6));
+fn hot_page_budget_evicts_reloads_and_bounds_full_replay() {
+    let disk = Arc::new(SimDisk::new(13));
     let opts = EngineOptions { hot_page_bytes: 128, ..options() };
     let engine = open(disk.clone(), opts.clone());
-    for i in 0u64..8 {
-        let s = scope(&i.to_string());
-        engine.append(&s, vec![turn(i)], Some("key")).unwrap();
+    let oldest = |engine: &Engine, i: u64| {
+        let query = WindowQuery::Since { seq: 1, limit: 1 };
+        engine.window(&scope(&i.to_string()), query).unwrap()[0].content.clone()
+    };
+    for i in 0u64..12 {
+        engine.append(&scope(&i.to_string()), vec![turn(i)], Some("key")).unwrap();
         engine.checkpoint().unwrap();
-        assert!(engine.metrics().unwrap().hot_page_bytes <= 128);
+        assert!(engine.metrics().unwrap().hot_page_bytes <= 128, "session {i}");
     }
-    for i in 0u64..8 {
-        let s = scope(&i.to_string());
-        assert_eq!(engine.window(&s, WindowQuery::Last(1)).unwrap()[0].content, i.to_le_bytes());
+    for i in 0u64..12 {
+        assert_eq!(oldest(&engine, i), i.to_le_bytes(), "cold reload of session {i}");
     }
-    engine.append(&scope("0"), vec![turn(8)], None).unwrap();
+    engine.append(&scope("0"), vec![turn(12)], None).unwrap();
     engine.checkpoint().unwrap();
     drop(engine);
-    let engine = open(disk, opts);
+    let engine = open(disk.clone(), opts.clone());
     assert_eq!(engine.window(&scope("0"), WindowQuery::Last(2)).unwrap().len(), 2);
+    assert!(engine.metrics().unwrap().hot_page_bytes <= 128);
+    drop(engine);
+    // A corrupt manifest forces full replay, which must spill to stay within one page.
+    let file = disk.open(Path::new("db/CHECKPOINT")).unwrap();
+    disk.flip_bit(file, 12).unwrap();
+    disk.close(file).unwrap();
+    let engine = open(disk, opts);
+    assert_eq!(engine.metrics().unwrap().checkpoint_warnings, 1);
+    for i in 0u64..12 {
+        assert_eq!(oldest(&engine, i), i.to_le_bytes(), "replayed session {i}");
+        let retry = engine.append(&scope(&i.to_string()), vec![turn(i)], Some("key")).unwrap();
+        assert!(retry.deduplicated && retry.seqs == [1], "replayed retry key {i}");
+    }
     assert!(engine.metrics().unwrap().hot_page_bytes <= 128);
 }
 
 #[test]
 fn write_outages_report_health_preserve_reads_and_retry_keys() {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq)]
     enum Fault {
         Floor,
         ColdFloor,
@@ -325,106 +324,95 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
         ReopenAllocation,
         ReopenStat,
         SpaceQuery,
-        Sync,
+        SyncError,
     }
+    use Fault::*;
     for (case, fault, health) in [
-        ("disk floor", Fault::Floor, Health::ReadOnly),
-        ("cold reads with no free space", Fault::ColdFloor, Health::ReadOnly),
-        ("reopen while full", Fault::ReopenFull, Health::ReadOnly),
-        ("reopen with dirty pages then full", Fault::ReopenDirtyFull, Health::ReadOnly),
-        ("reopen allocation race", Fault::ReopenAllocation, Health::ReadOnly),
-        ("reopen with space query failure", Fault::ReopenStat, Health::ReadOnly),
-        ("space query outage", Fault::SpaceQuery, Health::ReadOnly),
-        ("ambiguous sync", Fault::Sync, Health::Poisoned),
+        ("disk floor", Floor, Health::ReadOnly),
+        ("cold reads with no free space", ColdFloor, Health::ReadOnly),
+        ("reopen while full", ReopenFull, Health::ReadOnly),
+        ("reopen with dirty pages then full", ReopenDirtyFull, Health::ReadOnly),
+        ("reopen allocation race", ReopenAllocation, Health::ReadOnly),
+        ("reopen with space query failure", ReopenStat, Health::ReadOnly),
+        ("space query outage", SpaceQuery, Health::ReadOnly),
+        ("ambiguous sync", SyncError, Health::Poisoned),
     ] {
-        let seeds = if matches!(fault, Fault::Sync) { 32 } else { 1 };
-        for seed in 0..seeds {
+        let reopen = matches!(fault, ReopenFull | ReopenDirtyFull | ReopenAllocation | ReopenStat);
+        let history = if reopen || fault == ColdFloor { 512 } else { 1 };
+        for seed in 0..if fault == SyncError { 32 } else { 1 } {
             eprintln!("case: {case}, seed={seed}");
-            let io = Arc::new(support::ProbeIo::new(seed));
+            let (outage, no_space) =
+                (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (down, full) = (outage.clone(), no_space.clone());
+            let io = Arc::new(HookIo::sim(seed).with(move |op, next| match op {
+                Op::Available(_) | Op::Total(_) if down.load(Ordering::SeqCst) => {
+                    Err(zerodb_tape::Error::Io(
+                        std::io::ErrorKind::Other,
+                        "injected space query failure".into(),
+                    ))
+                }
+                Op::Allocate(..) if full.swap(false, Ordering::SeqCst) => {
+                    Err(zerodb_tape::Error::Io(
+                        std::io::ErrorKind::StorageFull,
+                        "injected allocation failure".into(),
+                    ))
+                }
+                _ => next(),
+            }));
+            let (disk, db) = (io.inner.clone(), Path::new("db"));
+            // Leaves `headroom` bytes free above what the database already uses.
+            let fill = |headroom| {
+                let used = disk.total_bytes(db).unwrap() - disk.available_bytes(db).unwrap();
+                disk.set_capacity(used + headroom).unwrap();
+            };
             let mut opts = options();
             opts.tape.free_space_floor = Some(4096);
-            let history = if matches!(
-                fault,
-                Fault::ColdFloor
-                    | Fault::ReopenFull
-                    | Fault::ReopenDirtyFull
-                    | Fault::ReopenAllocation
-                    | Fault::ReopenStat
-            ) {
-                512
-            } else {
-                1
-            };
-            if matches!(fault, Fault::ColdFloor | Fault::ReopenDirtyFull) {
+            if matches!(fault, ColdFloor | ReopenDirtyFull) {
                 opts.tape.lsn_index_bytes = 4224;
             }
-            let mut engine =
-                Engine::open_with(io.clone(), Arc::new(SimClock::default()), "db", opts.clone())
-                    .unwrap();
+            let mut engine = open(io.clone(), opts.clone());
             assert_eq!(engine.health(), Health::Ok, "{case}");
             let s = scope("s");
             let original = engine.append(&s, vec![turn(1); history], Some("original")).unwrap();
             let before = engine.metrics().unwrap();
             match fault {
-                Fault::Floor | Fault::ColdFloor => {
-                    let capacity = io.disk.total_bytes(std::path::Path::new("db")).unwrap();
-                    let free = io.disk.available_bytes(std::path::Path::new("db")).unwrap();
-                    let remaining = if matches!(fault, Fault::ColdFloor) { 0 } else { 4095 };
-                    io.disk.set_capacity(capacity - free + remaining).unwrap();
-                }
-                Fault::ReopenFull
-                | Fault::ReopenDirtyFull
-                | Fault::ReopenAllocation
-                | Fault::ReopenStat => {
-                    if matches!(fault, Fault::ReopenDirtyFull) {
+                Floor => fill(4095),
+                ColdFloor => fill(0),
+                SpaceQuery => outage.store(true, Ordering::SeqCst),
+                SyncError => disk.fail_next_sync().unwrap(),
+                ReopenFull | ReopenDirtyFull | ReopenAllocation | ReopenStat => {
+                    if fault == ReopenDirtyFull {
                         // Skip open-time replay, so recovery's last dirty page stays resident.
                         engine.checkpoint().unwrap();
                     }
                     drop(engine);
                     for name in ["LSN-OFFSETS", "LSN-ROUTES"] {
-                        let file = io.disk.open(&std::path::Path::new("db").join(name)).unwrap();
-                        io.disk.set_len(file, 0).unwrap();
-                        io.disk.set_len(file, 4096).unwrap();
-                        io.disk.sync_data(file).unwrap();
-                        io.disk.close(file).unwrap();
+                        let file = disk.open(&db.join(name)).unwrap();
+                        disk.set_len(file, 0).unwrap();
+                        disk.set_len(file, 4096).unwrap();
+                        disk.sync_data(file).unwrap();
+                        disk.close(file).unwrap();
                     }
-                    if matches!(fault, Fault::ReopenFull | Fault::ReopenDirtyFull) {
+                    if matches!(fault, ReopenFull | ReopenDirtyFull) {
                         // Open drops the old spare, so fill the disk without it.
-                        io.disk.remove(std::path::Path::new("db/spare.zdb")).unwrap();
-                        io.disk.sync_dir(std::path::Path::new("db")).unwrap();
-                        let capacity = io.disk.total_bytes(std::path::Path::new("db")).unwrap();
-                        let free = io.disk.available_bytes(std::path::Path::new("db")).unwrap();
+                        disk.remove(&db.join("spare.zdb")).unwrap();
+                        disk.sync_dir(db).unwrap();
                         // Recovery write-backs fit in 5 pages. Reservation plus floor needs two
                         // 1 MiB index chunks, so open stays read-only.
-                        let headroom =
-                            if matches!(fault, Fault::ReopenDirtyFull) { 20480 } else { 0 };
-                        io.disk.set_capacity(capacity - free + headroom).unwrap();
-                    } else if matches!(fault, Fault::ReopenAllocation) {
-                        io.allocation_full.store(true, Ordering::SeqCst);
+                        fill(if fault == ReopenDirtyFull { 20480 } else { 0 });
+                    } else if fault == ReopenAllocation {
+                        no_space.store(true, Ordering::SeqCst);
                     } else {
                         opts.tape.free_space_floor = None;
-                        io.space_error.store(true, Ordering::SeqCst);
+                        outage.store(true, Ordering::SeqCst);
                     }
-                    engine = Engine::open_with(
-                        io.clone(),
-                        Arc::new(SimClock::default()),
-                        "db",
-                        opts.clone(),
-                    )
-                    .unwrap();
+                    engine = open(io.clone(), opts.clone());
                     assert_eq!(engine.health(), Health::ReadOnly, "{case}: open did not poison");
-                    if matches!(fault, Fault::ReopenAllocation) {
-                        assert!(
-                            !io.allocation_full.load(Ordering::SeqCst),
-                            "{case}: reservation was attempted"
-                        );
+                    assert!(!no_space.load(Ordering::SeqCst), "{case}: reservation was attempted");
+                    if matches!(fault, ReopenAllocation | ReopenDirtyFull) {
+                        fill(0);
                     }
-                    if matches!(fault, Fault::ReopenAllocation | Fault::ReopenDirtyFull) {
-                        let capacity = io.disk.total_bytes(std::path::Path::new("db")).unwrap();
-                        let free = io.disk.available_bytes(std::path::Path::new("db")).unwrap();
-                        io.disk.set_capacity(capacity - free).unwrap();
-                    }
-                    let full_before = io.disk.storage_full_returns().unwrap();
+                    let full_before = disk.storage_full_returns().unwrap();
                     let oldest =
                         engine.window(&s, WindowQuery::Since { seq: 1, limit: 1 }).unwrap();
                     assert_eq!(
@@ -433,10 +421,11 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
                         "{case}: acknowledged turn survived reopen"
                     );
                     assert_eq!(oldest[0].lsn, original.first_lsn, "{case}");
-                    if matches!(fault, Fault::ReopenDirtyFull) {
+                    if fault == ReopenDirtyFull {
                         let index = engine.metrics().unwrap().tape_index;
+                        let full = disk.storage_full_returns().unwrap();
                         assert!(
-                            io.disk.storage_full_returns().unwrap() > full_before,
+                            full > full_before,
                             "{case}: cold read could not write back a dirty page"
                         );
                         assert!(
@@ -444,53 +433,40 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
                             "{case}: cold read overshoot is one page"
                         );
                     }
-                    if matches!(
-                        fault,
-                        Fault::ReopenFull | Fault::ReopenDirtyFull | Fault::ReopenAllocation
-                    ) {
+                    if fault != ReopenStat {
                         assert_eq!(
-                            io.disk.available_bytes(std::path::Path::new("db")).unwrap(),
+                            disk.available_bytes(db).unwrap(),
                             0,
                             "{case}: zero free after reopen"
                         );
                     }
                 }
-                Fault::SpaceQuery => io.space_error.store(true, Ordering::SeqCst),
-                Fault::Sync => io.disk.fail_next_sync().unwrap(),
             }
             for attempt in 0..2 {
                 let error = engine.append(&s, vec![turn(2)], Some("retry")).unwrap_err();
-                let expected = if matches!(fault, Fault::Sync) && attempt == 0 {
-                    Outcome::Unknown
-                } else {
-                    Outcome::NotCommitted
-                };
-                assert_eq!(error.outcome, expected, "{case}, attempt={attempt}");
+                let unknown = fault == SyncError && attempt == 0;
+                let outcome = if unknown { Outcome::Unknown } else { Outcome::NotCommitted };
+                assert_eq!(error.outcome, outcome, "{case}, attempt={attempt}");
                 assert!(
                     match fault {
-                        Fault::Floor
-                        | Fault::ColdFloor
-                        | Fault::ReopenFull
-                        | Fault::ReopenDirtyFull
-                        | Fault::ReopenAllocation =>
-                            matches!(error.kind, ErrorKind::Storage(zerodb_tape::Error::DiskFull)),
-                        Fault::SpaceQuery | Fault::ReopenStat => matches!(
-                            error.kind,
-                            ErrorKind::Storage(zerodb_tape::Error::Io(
-                                std::io::ErrorKind::Other,
-                                ref message
-                            )) if message == "injected space query failure"
+                        SpaceQuery | ReopenStat => matches!(
+                            &error.kind,
+                            ErrorKind::Storage(zerodb_tape::Error::Io(std::io::ErrorKind::Other, message))
+                                if message == "injected space query failure"
                         ),
-                        Fault::Sync if attempt == 0 => matches!(
-                            error.kind,
-                            ErrorKind::Storage(zerodb_tape::Error::SyncFailed(_))
-                        ),
-                        Fault::Sync => matches!(error.kind, ErrorKind::Poisoned),
+                        SyncError if unknown => {
+                            matches!(
+                                error.kind,
+                                ErrorKind::Storage(zerodb_tape::Error::SyncFailed(_))
+                            )
+                        }
+                        SyncError => matches!(error.kind, ErrorKind::Poisoned),
+                        _ => matches!(error.kind, ErrorKind::Storage(zerodb_tape::Error::DiskFull)),
                     },
                     "{case}, attempt={attempt}: {error:?}"
                 );
                 assert_eq!(engine.health(), health, "{case}");
-                if !matches!(fault, Fault::Sync) {
+                if fault != SyncError {
                     assert_deduplicated(
                         &original,
                         engine.append(&s, vec![turn(1); history], Some("original")).unwrap(),
@@ -501,7 +477,7 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
                     assert_eq!(conflict.outcome, Outcome::NotCommitted, "{case}");
                     assert_eq!(engine.health(), health, "{case}: retries do not recheck space");
                 }
-                if matches!(fault, Fault::ColdFloor) {
+                if fault == ColdFloor {
                     assert!(
                         before.tape_index.dirty_page_evictions > 0,
                         "{case}: multiple dirty pages"
@@ -517,7 +493,7 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
                     }
                     assert_eq!(
                         cold.iter().map(|turn| turn.seq).collect::<Vec<_>>(),
-                        vec![1, 2, 3],
+                        [1, 2, 3],
                         "{case}"
                     );
                     assert!(cold.iter().all(|value| value.content == turn(1).content), "{case}");
@@ -525,11 +501,7 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
                         after_cold.page_reloads > before_cold.page_reloads,
                         "{case}: cold index read"
                     );
-                    assert_eq!(
-                        io.disk.available_bytes(std::path::Path::new("db")).unwrap(),
-                        0,
-                        "{case}"
-                    );
+                    assert_eq!(disk.available_bytes(db).unwrap(), 0, "{case}");
                     assert_eq!(
                         engine.health(),
                         Health::ReadOnly,
@@ -545,37 +517,31 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
                 assert_eq!(after.dedup_entries, before.dedup_entries, "{case}");
                 assert_eq!(after.tenants, before.tenants, "{case}");
             }
-            io.disk.set_capacity(1 << 40).unwrap();
-            io.space_error.store(false, Ordering::SeqCst);
+            disk.set_capacity(1 << 40).unwrap();
+            outage.store(false, Ordering::SeqCst);
             assert_eq!(engine.health(), health, "{case}: no write has rechecked space");
-            if matches!(fault, Fault::Sync) {
+            if fault == SyncError {
                 drop(engine);
-                engine = open(Arc::new(io.disk.crash().unwrap()), opts.clone());
+                engine = open(Arc::new(disk.crash().unwrap()), opts.clone());
                 assert_eq!(engine.health(), Health::Ok, "{case}");
             }
             // Only an ambiguous sync can leave the first attempt durable across the crash.
             let survived = engine.metrics().unwrap().durable_lsn > original.last_lsn;
-            assert!(!survived || matches!(fault, Fault::Sync), "{case}: a rejection wrote nothing");
+            assert!(!survived || fault == SyncError, "{case}: a rejection wrote nothing");
             let retried = engine.append(&s, vec![turn(2)], Some("retry")).unwrap();
             assert_eq!(retried.deduplicated, survived, "{case}: retry after restart");
             assert_eq!(engine.health(), Health::Ok, "{case}");
-            if matches!(
-                fault,
-                Fault::ReopenFull
-                    | Fault::ReopenDirtyFull
-                    | Fault::ReopenAllocation
-                    | Fault::ReopenStat
-            ) {
+            if reopen {
                 for (name, width) in [("LSN-OFFSETS", 8), ("LSN-ROUTES", 16)] {
-                    let file = io.disk.open(&std::path::Path::new("db").join(name)).unwrap();
+                    let file = disk.open(&db.join(name)).unwrap();
                     // Index backing grows in whole 1 MiB chunks.
                     let required = (retried.last_lsn * width).div_ceil(1 << 20) << 20;
                     assert_eq!(
-                        io.disk.len(file).unwrap(),
+                        disk.len(file).unwrap(),
                         required,
                         "{case}: retried {name} reservation"
                     );
-                    io.disk.close(file).unwrap();
+                    disk.close(file).unwrap();
                 }
             }
             assert_eq!(retried.seqs, vec![history as u64 + 1], "{case}");
@@ -583,44 +549,27 @@ fn write_outages_report_health_preserve_reads_and_retry_keys() {
             assert_eq!(retried.first_lsn, original.last_lsn + 1, "{case}");
             assert_eq!(retried.last_lsn, retried.first_lsn, "{case}");
             let retried = Appended { deduplicated: false, ..retried };
-            assert_deduplicated(
-                &retried,
-                engine.append(&s, vec![turn(2)], Some("retry")).unwrap(),
-                case,
-            );
+            let retry = |engine: &Engine| engine.append(&s, vec![turn(2)], Some("retry")).unwrap();
+            let again = |engine: &Engine| {
+                engine.append(&s, vec![turn(1); history], Some("original")).unwrap()
+            };
+            assert_deduplicated(&retried, retry(&engine), case);
             assert_eq!(engine.metrics().unwrap().durable_lsn, retried.last_lsn, "{case}");
             assert_eq!(engine.metrics().unwrap().dedup_entries, before.dedup_entries + 1, "{case}");
             let window = engine.window(&s, WindowQuery::Last(10)).unwrap();
-            assert_eq!(
-                window.iter().map(|turn| turn.seq).collect::<Vec<_>>(),
-                (history as u64 + 1 - history.min(9) as u64..=history as u64 + 1)
-                    .collect::<Vec<_>>(),
-                "{case}"
-            );
-            assert!(
-                window[..window.len() - 1].iter().all(|value| value.content == turn(1).content),
-                "{case}"
-            );
-            assert_eq!(window.last().unwrap().content, turn(2).content, "{case}");
-            assert_deduplicated(
-                &original,
-                engine.append(&s, vec![turn(1); history], Some("original")).unwrap(),
-                case,
-            );
-            if !matches!(fault, Fault::Sync) {
+            let first = history as u64 + 1 - history.min(9) as u64;
+            let seqs = window.iter().map(|turn| turn.seq).collect::<Vec<_>>();
+            assert_eq!(seqs, (first..=history as u64 + 1).collect::<Vec<_>>(), "{case}");
+            let (last, older) = window.split_last().unwrap();
+            assert!(older.iter().all(|value| value.content == turn(1).content), "{case}");
+            assert_eq!(last.content, turn(2).content, "{case}");
+            assert_deduplicated(&original, again(&engine), case);
+            if fault != SyncError {
                 drop(engine);
-                let engine = open(Arc::new(io.disk.crash().unwrap()), opts);
+                let engine = open(Arc::new(disk.crash().unwrap()), opts);
                 assert_eq!(engine.health(), Health::Ok, "{case}");
-                assert_deduplicated(
-                    &original,
-                    engine.append(&s, vec![turn(1); history], Some("original")).unwrap(),
-                    case,
-                );
-                assert_deduplicated(
-                    &retried,
-                    engine.append(&s, vec![turn(2)], Some("retry")).unwrap(),
-                    case,
-                );
+                assert_deduplicated(&original, again(&engine), case);
+                assert_deduplicated(&retried, retry(&engine), case);
                 assert_eq!(engine.window(&s, WindowQuery::Last(10)).unwrap(), window, "{case}");
             }
         }
@@ -651,36 +600,32 @@ fn concurrent_same_key_writes_once() {
 }
 
 #[test]
-fn invalid_batches_leave_no_sequences_or_tenants() {
-    let engine = open(Arc::new(SimDisk::new(9)), options());
-    assert!(engine.append(&scope("s"), vec![], None).is_err());
-    assert!(engine.append(&scope("s"), vec![turn(1); 1024], None).is_err());
-    let mut too_big = turn(1);
-    too_big.content = vec![0; 4 * 1024 * 1024];
-    assert!(engine.append(&scope("s"), vec![too_big], None).is_err());
-    for (case, key) in [("empty key", String::new()), ("1025-byte key", "k".repeat(1025))] {
-        let error = engine.fact_put("new", new_fact(&key, 1, "a"), None, None).unwrap_err();
-        assert!(matches!(error.kind, ErrorKind::InvalidInput), "{case}: {error}");
+fn invalid_and_over_limit_writes_are_typed_and_write_nothing() {
+    let opts = EngineOptions { max_sessions: 1, max_pages: 1, ..options() };
+    let engine = open(Arc::new(SimDisk::new(9)), opts);
+    let s = scope("s");
+    let too_big = NewTurn { content: vec![0; 4 * 1024 * 1024], ..turn(1) };
+    let append = |turns| engine.append(&s, turns, None).unwrap_err();
+    let fact = |key: &str| engine.fact_put("new", new_fact(key, 1, "a"), None, None).unwrap_err();
+    for (case, error, kind) in [
+        ("empty batch", append(vec![]), "InvalidInput"),
+        ("1024 turns", append(vec![turn(1); 1024]), "Storage(BatchTooLarge)"),
+        ("4 MiB turn", append(vec![too_big]), "Storage(BatchTooLarge)"),
+        ("empty fact key", fact(""), "InvalidInput"),
+        ("1025-byte fact key", fact(&"k".repeat(1025)), "InvalidInput"),
+    ] {
+        assert_eq!(format!("{:?}", error.kind), kind, "{case}");
+        assert_eq!(error.outcome, Outcome::NotCommitted, "{case}");
     }
     assert_eq!(engine.metrics().unwrap().tenants, 0);
     assert_eq!(engine.metrics().unwrap().durable_lsn, 0);
-    assert_eq!(engine.append(&scope("s"), vec![turn(1)], None).unwrap().seqs, vec![1]);
-}
-
-#[test]
-fn session_and_page_directories_have_typed_bounds() {
-    let opts = EngineOptions { max_sessions: 1, max_pages: 1, ..options() };
-    let engine = open(Arc::new(SimDisk::new(10)), opts);
-    engine.append(&scope("s"), vec![turn(1); 16], None).unwrap();
-    assert!(matches!(
-        engine.append(&scope("other"), vec![turn(1)], None).unwrap_err().kind,
-        ErrorKind::ResourceExhausted("sessions")
-    ));
-    assert!(matches!(
-        engine.append(&scope("s"), vec![turn(1)], None).unwrap_err().kind,
-        ErrorKind::ResourceExhausted("page_directory")
-    ));
-    assert_eq!(engine.window(&scope("s"), WindowQuery::Last(100)).unwrap().len(), 16);
+    let seqs = engine.append(&s, vec![turn(1); 16], None).unwrap().seqs;
+    assert_eq!(seqs, (1..=16).collect::<Vec<_>>(), "rejections consumed no sequences");
+    for (session, limit) in [("other", "sessions"), ("s", "page_directory")] {
+        let error = engine.append(&scope(session), vec![turn(1)], None).unwrap_err();
+        assert!(matches!(error.kind, ErrorKind::ResourceExhausted(l) if l == limit), "{error}");
+    }
+    assert_eq!(engine.window(&s, WindowQuery::Last(100)).unwrap().len(), 16);
 }
 
 #[test]
@@ -713,33 +658,6 @@ fn automatic_worker_checkpoint_and_checkpoint_failure_do_not_poison_tape() {
 }
 
 #[test]
-fn corrupt_checkpoint_full_replay_can_spill_with_a_one_page_budget() {
-    let disk = Arc::new(SimDisk::new(13));
-    let opts = EngineOptions { hot_page_bytes: 128, ..options() };
-    let engine = open(disk.clone(), opts.clone());
-    for i in 0u64..12 {
-        engine.append(&scope(&i.to_string()), vec![turn(i)], Some("key")).unwrap();
-        engine.checkpoint().unwrap();
-    }
-    drop(engine);
-    let file = disk.open(std::path::Path::new("db/CHECKPOINT")).unwrap();
-    disk.flip_bit(file, 12).unwrap();
-    disk.close(file).unwrap();
-    let engine = open(disk, opts);
-    for i in 0u64..12 {
-        assert_eq!(
-            engine.window(&scope(&i.to_string()), WindowQuery::Last(1)).unwrap()[0].content,
-            i.to_le_bytes()
-        );
-        assert_eq!(
-            engine.append(&scope(&i.to_string()), vec![turn(i)], Some("key")).unwrap().seqs,
-            vec![1]
-        );
-    }
-    assert!(engine.metrics().unwrap().hot_page_bytes <= 128);
-}
-
-#[test]
 fn long_session_evicts_its_own_old_pages() {
     let disk = Arc::new(SimDisk::new(14));
     let opts = EngineOptions { hot_page_bytes: 32768, ..options() };
@@ -768,106 +686,56 @@ fn long_session_evicts_its_own_old_pages() {
 }
 
 #[test]
-fn receipts_need_no_reads_and_checkpoint_io_uses_worker() {
-    let io = Arc::new(support::ProbeIo::new(15));
-    let engine =
-        Engine::open_with(io.clone(), Arc::new(SimClock::default()), "db", options()).unwrap();
-    io.fail_read.store(true, Ordering::SeqCst);
+fn receipts_need_no_reads_and_background_io_stays_off_the_writer() {
+    let io = Arc::new(HookIo::sim(15));
+    let clock = Arc::new(SimClock::default());
+    let engine = Engine::open_with(io.clone(), clock.clone(), "db", options()).unwrap();
+    let (reads, writes) = (io.tally(|op| matches!(op, Op::Read(..)) as u64), writes(&io));
     let receipt = engine.append(&scope("s"), vec![turn(1)], Some("key")).unwrap();
     assert_eq!(receipt.seqs, vec![1]);
-    assert_deduplicated(
-        &receipt,
-        engine.append(&scope("s"), vec![turn(1)], Some("key")).unwrap(),
-        "retry",
-    );
-    assert!(io.fail_read.swap(false, Ordering::SeqCst), "append and retry must not read");
-    assert_eq!(engine.window(&scope("s"), WindowQuery::Last(1)).unwrap()[0].seq, 1);
-    assert_eq!(engine.append(&scope("s"), vec![turn(1)], Some("key")).unwrap().seqs, vec![1]);
-    engine.checkpoint().unwrap();
-    let writes = io.writes.lock().unwrap();
-    let checkpoint_writes: Vec<_> = writes
-        .iter()
-        .filter(|(_, path)| {
-            let name = path.file_name().unwrap().to_str().unwrap();
-            name.starts_with("ckpt-") || name == "CHECKPOINT.next"
-        })
-        .collect();
-    assert!(!checkpoint_writes.is_empty());
-    assert!(checkpoint_writes.iter().all(|(thread, _)| thread == "zerodb-checkpoint"));
-}
-
-#[test]
-fn checkpoint_file_is_written_in_one_buffer() {
-    let io = Arc::new(support::ProbeIo::new(42));
-    let engine =
-        Engine::open_with(io.clone(), Arc::new(SimClock::default()), "db", options()).unwrap();
+    let retry = engine.append(&scope("s"), vec![turn(1)], Some("key")).unwrap();
+    assert_deduplicated(&receipt, retry, "retry");
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "append and retry must not read");
     for i in 0..20 {
         engine.append(&scope(&format!("session-{i}")), vec![turn(i)], None).unwrap();
     }
-
-    io.writes.lock().unwrap().clear();
     engine.checkpoint().unwrap();
-    let writes = io.writes.lock().unwrap();
-    let data_writes = writes
-        .iter()
-        .filter(|(_, path)| path.file_name().unwrap().to_str().unwrap().starts_with("ckpt-"))
-        .count();
-    assert_eq!(data_writes, 1);
-}
-
-#[test]
-fn periodic_superblock_io_does_not_run_on_the_writer() {
-    let io = Arc::new(support::ProbeIo::new(43));
-    let clock = Arc::new(SimClock::default());
-    let engine = Engine::open_with(io.clone(), clock.clone(), "db", options()).unwrap();
-    io.writes.lock().unwrap().clear();
+    let threads = |prefix: &str| -> Vec<String> {
+        let writes = writes.lock().unwrap();
+        writes.iter().filter(|(_, file)| file.starts_with(prefix)).map(|w| w.0.clone()).collect()
+    };
+    assert_eq!(threads("ckpt-").len(), 1, "the checkpoint file is written in one buffer");
+    let checkpoint = [threads("ckpt-"), threads("CHECKPOINT.next")].concat();
+    assert!(checkpoint.iter().all(|thread| thread == "zerodb-checkpoint"), "{checkpoint:?}");
+    writes.lock().unwrap().clear();
     clock.advance(31_000_000_000);
-    engine.append(&scope("s"), vec![turn(1)], None).unwrap();
+    engine.append(&scope("s"), vec![turn(2)], None).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let names = io
-            .writes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, p)| p.file_name().unwrap() == "SUPERBLOCK.tmp")
-            .map(|(thread, _)| thread.clone())
-            .collect::<Vec<_>>();
-        if !names.is_empty() {
-            assert!(names.iter().all(|name| name == "zerodb-maintenance"), "{names:?}");
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline);
+    while threads("SUPERBLOCK.tmp").is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no periodic superblock install");
         std::thread::yield_now();
     }
+    let superblock = threads("SUPERBLOCK.tmp");
+    assert!(superblock.iter().all(|thread| thread == "zerodb-maintenance"), "{superblock:?}");
 }
 
 #[test]
 fn replay_spills_by_dirty_capacity_not_clean_resident_pages() {
-    let io = Arc::new(support::ProbeIo::new(16));
-    let engine =
-        Engine::open_with(io.clone(), Arc::new(SimClock::default()), "db", options()).unwrap();
+    let io = Arc::new(HookIo::sim(16));
+    let engine = open(io.clone(), options());
     for i in 0..1300 {
         engine.append(&scope(&i.to_string()), vec![turn(i)], None).unwrap();
     }
     drop(engine);
-    io.writes.lock().unwrap().clear();
-    let opts = EngineOptions { hot_page_bytes: 128 * 1024, ..options() };
-    let engine = Engine::open_with(io.clone(), Arc::new(SimClock::default()), "db", opts).unwrap();
-    let files: std::collections::BTreeSet<_> = io
-        .writes
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(_, p)| p.file_name().unwrap().to_str().unwrap().starts_with("ckpt-"))
-        .map(|(_, p)| p.clone())
-        .collect();
+    let writes = writes(&io);
+    let engine = open(io, EngineOptions { hot_page_bytes: 128 * 1024, ..options() });
+    let writes = writes.lock().unwrap();
+    let files: std::collections::BTreeSet<_> =
+        writes.iter().filter(|(_, file)| file.starts_with("ckpt-")).map(|w| &w.1).collect();
     assert!(!files.is_empty());
     assert!(files.len() <= 3, "{} checkpoints for 1300 dirty pages", files.len());
-    assert_eq!(
-        engine.window(&scope("1299"), WindowQuery::Last(1)).unwrap()[0].content,
-        1299u64.to_le_bytes()
-    );
+    let newest = engine.window(&scope("1299"), WindowQuery::Last(1)).unwrap();
+    assert_eq!(newest[0].content, 1299u64.to_le_bytes());
 }
 
 #[test]
@@ -904,17 +772,25 @@ fn failed_sync_with_a_full_dedup_window_cannot_checkpoint_tentative_eviction() {
 fn cold_window_and_pin_io_do_not_hold_the_writer_state_lock() {
     for append in [false, true] {
         eprintln!("case: append={append:?}");
-        let io = Arc::new(support::ProbeIo::new(18));
-        let opts = EngineOptions { hot_page_bytes: 256, ..options() };
-        let engine =
-            Engine::open_with(io.clone(), Arc::new(SimClock::default()), "db", opts).unwrap();
+        let io = Arc::new(HookIo::sim(18));
+        let engine = open(io.clone(), EngineOptions { hot_page_bytes: 256, ..options() });
         for i in 0..3 {
             engine.append(&scope(&i.to_string()), vec![turn(i)], None).unwrap();
             engine.checkpoint().unwrap();
         }
         let (entered, blocked) = std::sync::mpsc::sync_channel(1);
         let (release, resumed) = std::sync::mpsc::sync_channel(1);
-        *io.read_gate.lock().unwrap() = Some((entered, resumed));
+        // The first checkpoint read parks until the test releases it.
+        let gate = Mutex::new(Some((entered, resumed)));
+        io.add(move |op, next| {
+            let cold = matches!(op, Op::Read(..)) && op.name().starts_with("ckpt-");
+            let parked = cold.then(|| gate.lock().unwrap().take()).flatten();
+            if let Some((entered, resumed)) = parked {
+                entered.send(()).unwrap();
+                resumed.recv().unwrap();
+            }
+            next()
+        });
         std::thread::scope(|threads| {
             threads.spawn(|| {
                 if append {
@@ -973,17 +849,12 @@ fn open_sweeps_orphan_checkpoints_only_after_taking_the_tape_lock() {
 fn checkpoints_advance_while_tiny_budget_writers_append_continuously() {
     let engine =
         open(Arc::new(SimDisk::new(20)), EngineOptions { hot_page_bytes: 2048, ..options() });
-    let barrier = Barrier::new(5);
-    let active = std::sync::atomic::AtomicUsize::new(4);
-    let acked = AtomicU64::new(0);
-    let retries = AtomicU64::new(0);
+    let (barrier, active) = (Barrier::new(5), std::sync::atomic::AtomicUsize::new(4));
+    let (acked, retries) = (AtomicU64::new(0), AtomicU64::new(0));
     std::thread::scope(|threads| {
         for thread in 0..4 {
-            let engine = &engine;
-            let barrier = &barrier;
-            let active = &active;
-            let acked = &acked;
-            let retries = &retries;
+            let (engine, barrier, active, acked, retries) =
+                (&engine, &barrier, &active, &acked, &retries);
             threads.spawn(move || {
                 barrier.wait();
                 // Other writers can refill the 2 KiB budget between the engine's flush and its
@@ -1057,9 +928,7 @@ fn stdio_eight_threads_sixty_four_sessions_reopen_equals_oracle() {
     let barrier = Barrier::new(8);
     std::thread::scope(|threads| {
         for thread in 0..8 {
-            let engine = &engine;
-            let oracle = &oracle;
-            let barrier = &barrier;
+            let (engine, oracle, barrier) = (&engine, &oracle, &barrier);
             threads.spawn(move || {
                 barrier.wait();
                 for round in 0..32 {
@@ -1091,28 +960,19 @@ fn stdio_eight_threads_sixty_four_sessions_reopen_equals_oracle() {
     drop(engine);
 }
 
-mod metrics {
-    use crate::support::sessions::*;
-    use std::sync::Arc;
-    use zerodb_core::EngineOptions;
-    use zerodb_tape::{SimDisk, TapeOptions};
-
-    #[test]
-    fn engine_metrics_expose_eviction_without_changing_the_index_budget() {
-        let opts = EngineOptions {
-            tape: TapeOptions { segment_size: 8192, lsn_index_bytes: 12 * 1024, ..options().tape },
-            ..options()
-        };
-        let engine = open(Arc::new(SimDisk::new(78)), opts);
-        assert_eq!(engine.metrics().unwrap().tape_index.page_evictions, 0);
-        let scope = scope("s");
-        for _ in 0..20 {
-            engine.append(&scope, vec![turn(u64::from_le_bytes([7; 8])); 64], None).unwrap();
-        }
-        let index = engine.metrics().unwrap().tape_index;
-        assert!(index.page_evictions > 0);
-        assert!(index.dirty_page_evictions > 0);
-        assert_eq!(index.budget_bytes, 12 * 1024);
-        assert!(index.resident_bytes <= index.budget_bytes);
+#[test]
+fn engine_metrics_expose_eviction_without_changing_the_index_budget() {
+    let opts = EngineOptions {
+        tape: TapeOptions { segment_size: 8192, lsn_index_bytes: 12 * 1024, ..options().tape },
+        ..options()
+    };
+    let engine = open(Arc::new(SimDisk::new(78)), opts);
+    assert_eq!(engine.metrics().unwrap().tape_index.page_evictions, 0);
+    for _ in 0..20 {
+        engine.append(&scope("s"), vec![turn(u64::from_le_bytes([7; 8])); 64], None).unwrap();
     }
+    let index = engine.metrics().unwrap().tape_index;
+    assert!(index.page_evictions > 0 && index.dirty_page_evictions > 0, "{index:?}");
+    assert_eq!(index.budget_bytes, 12 * 1024);
+    assert!(index.resident_bytes <= index.budget_bytes);
 }

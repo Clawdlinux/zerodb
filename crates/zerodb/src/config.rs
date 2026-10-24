@@ -254,23 +254,20 @@ fn check_tenant_name(name: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::*;
 
     #[test]
     fn debug_never_shows_tokens() {
+        let parse = |token: &str| {
+            super::parse(&format!(r#"{{"tenants": [{{"name": "a", "token": "{token}"}}]}}"#))
+        };
         let secret = "secret-token-0123456789abcdefghijkl";
-        let config = parse(&format!(r#"{{"tenants": [{{"name": "a", "token": "{secret}"}}]}}"#));
-        assert!(!format!("{:?}", config.unwrap()).contains(secret), "Debug redacts tokens");
+        assert!(!format!("{:?}", parse(secret).unwrap()).contains(secret), "Debug redacts tokens");
         for (bytes, ok) in [(31, false), (32, true), (1024, true), (1025, false)] {
             let token = "t".repeat(bytes);
-            let config = parse(&format!(r#"{{"tenants": [{{"name": "a", "token": "{token}"}}]}}"#));
-            match config {
-                Ok(_) => assert!(ok, "{bytes}-byte token accepted"),
-                Err(error) => {
-                    assert!(!ok && error.contains("32 to 1024 bytes"), "{bytes}: {error}");
-                    assert!(!error.contains(&token), "{bytes}: the error echoes the token");
-                }
-            }
+            let error = parse(&token).err().unwrap_or_default();
+            assert_eq!(error.is_empty(), ok, "{bytes}-byte token: {error}");
+            let named = error.contains("32 to 1024 bytes") && !error.contains(&token);
+            assert!(ok || named, "{bytes}: the error names the rule, not the token: {error}");
         }
     }
 }

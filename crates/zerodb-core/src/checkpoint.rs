@@ -751,7 +751,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use zerodb_tape::{LockGuard, SimDisk};
+    use zerodb_tape::{HookIo, Op, SimDisk};
 
     fn fixture(disk: &SimDisk, shapes: &[(usize, usize)], boundary: u64) {
         let path = Path::new("db/ckpt-3.zdb");
@@ -829,32 +829,24 @@ mod tests {
         let disk = Arc::new(SimDisk::new(5));
         let scope = Scope { tenant: "t".into(), agent: "a".into(), session: "s".into() };
         let turn = NewTurn { role: Role::User, content: vec![1], meta: vec![] };
-        let engine = Engine::open_with(
-            disk.clone(),
-            Arc::new(zerodb_tape::sim::SimClock::default()),
-            "db",
-            EngineOptions::default(),
-        )
-        .unwrap();
+        let open = || {
+            let clock = Arc::new(zerodb_tape::sim::SimClock::default());
+            Engine::open_with(disk.clone(), clock, "db", EngineOptions::default()).unwrap()
+        };
+        let engine = open();
         engine.append(&scope, vec![turn.clone(); 2], None).unwrap();
         engine.checkpoint().unwrap();
         engine.append(&scope, vec![turn], None).unwrap();
         drop(engine);
         fixture(&disk, &[(0, 1)], 3);
-        let engine = Engine::open_with(
-            disk,
-            Arc::new(zerodb_tape::sim::SimClock::default()),
-            "db",
-            EngineOptions::default(),
-        )
-        .unwrap();
+        let engine = open();
         assert_eq!(engine.metrics().unwrap().checkpoint_warnings, 1);
         assert_eq!(engine.metrics().unwrap().replayed_records, 4);
         assert_eq!(engine.window(&scope, WindowQuery::Last(10)).unwrap().len(), 3);
     }
 
     #[test]
-    fn full_snapshot_shares_pages_and_measures_its_lock_hold() {
+    fn full_snapshot_shares_pages_and_later_deltas_skip_unchanged_sessions() {
         let disk = SimDisk::new(6);
         let shared = state();
         let key = Key(1, "a".into(), "0".into());
@@ -892,6 +884,19 @@ mod tests {
         assert!(shared.lock().unwrap().checkpoint_lock_ns >= ns);
         eprintln!("full checkpoint snapshot: 1000 pages, lock_hold_ns={ns}");
         assert!(ns > 0);
+        {
+            let mut state = shared.lock().unwrap();
+            state.index.reserve(&key, 1).unwrap();
+            state.index.publish(&key, 3, 1003).unwrap();
+            state.dirty.insert((key, 0));
+            state.published_lsn = 1003;
+            state.txn = 1002;
+        }
+        save(&disk, Path::new("db"), &shared).unwrap();
+        let name = shared.lock().unwrap().chain.last().unwrap().name.clone();
+        let file = disk.open(&Path::new("db").join(name)).unwrap();
+        assert!(disk.len(file).unwrap() < 128, "a delta rewrites only the changed session");
+        disk.close(file).unwrap();
     }
 
     fn append(state: &Mutex<State>, seq: u64) {
@@ -952,119 +957,60 @@ mod tests {
         assert_eq!(loaded.warnings, 1);
     }
 
-    struct FaultIo {
-        disk: SimDisk,
-        at: usize,
-        count: AtomicUsize,
-        crashed: Mutex<Option<SimDisk>>,
-        writes: Mutex<Vec<(u64, usize)>>,
-        created: Mutex<Vec<PathBuf>>,
-        tear_write: AtomicBool,
-        skip_cleanup_sync: AtomicBool,
-        capture_rename: AtomicBool,
-    }
-    impl FaultIo {
-        fn new(disk: SimDisk, at: usize) -> Self {
-            Self {
-                disk,
-                at,
-                count: AtomicUsize::new(0),
-                crashed: Mutex::new(None),
-                writes: Mutex::new(Vec::new()),
-                created: Mutex::new(Vec::new()),
-                tear_write: AtomicBool::new(false),
-                skip_cleanup_sync: AtomicBool::new(false),
-                capture_rename: AtomicBool::new(false),
-            }
-        }
-        fn hit<T>(&self, result: zerodb_tape::Result<T>) -> zerodb_tape::Result<T> {
-            let value = result?;
-            if self.count.fetch_add(1, Ordering::SeqCst) + 1 == self.at {
-                *self.crashed.lock().unwrap() = Some(self.disk.crash()?);
+    type Image = Arc<Mutex<Option<SimDisk>>>;
+
+    /// Fails the `at`th successful call, except close and space queries, right after it ran.
+    /// Returns a crash image taken at that point.
+    fn crash_at(disk: SimDisk, at: usize) -> (HookIo, Image) {
+        let (image, seen, crash) = (Image::default(), AtomicUsize::new(0), disk.clone());
+        let crashed = image.clone();
+        let io = HookIo::new(disk).with(move |op, next| {
+            next()?;
+            let counted = !matches!(op, Op::Close(_) | Op::Available(_) | Op::Total(_));
+            if counted && seen.fetch_add(1, Ordering::SeqCst) + 1 == at {
+                *crashed.lock().unwrap() = Some(crash.crash()?);
                 return Err(zerodb_tape::Error::Io(
                     std::io::ErrorKind::Interrupted,
                     "crash".into(),
                 ));
             }
-            Ok(value)
-        }
+            Ok(())
+        });
+        (io, image)
     }
-    impl Io for FaultIo {
-        fn create(&self, p: &Path) -> zerodb_tape::Result<FileId> {
-            self.created.lock().unwrap().push(p.to_owned());
-            self.hit(self.disk.create(p))
-        }
-        fn open(&self, p: &Path) -> zerodb_tape::Result<FileId> {
-            self.hit(self.disk.open(p))
-        }
-        fn close(&self, f: FileId) -> zerodb_tape::Result<()> {
-            self.disk.close(f)
-        }
-        fn write_at(&self, f: FileId, o: u64, d: &[u8]) -> zerodb_tape::Result<()> {
-            self.writes.lock().unwrap().push((o, d.len()));
-            if self.tear_write.swap(false, Ordering::SeqCst) {
-                let header = u32::from_le_bytes(d[4..8].try_into().unwrap()) as usize;
-                let tenant =
-                    u32::from_le_bytes(d[header + 4..header + 8].try_into().unwrap()) as usize;
-                self.disk.write_at(f, o, &d[..header + tenant])?;
-                self.disk.sync_data(f)?;
-                self.skip_cleanup_sync.store(true, Ordering::SeqCst);
-                return Err(zerodb_tape::Error::Io(
+
+    /// Persists only the header and tenant records of the next write, then fails it.
+    /// The next directory sync also fails, so cleanup removals stay unsynced.
+    fn tear_next_write(io: &HookIo) {
+        let (disk, armed, unsynced) =
+            (io.inner.clone(), AtomicBool::new(true), AtomicBool::new(false));
+        io.add(move |op, next| match op {
+            Op::Write(_, file, offset, data) if armed.swap(false, Ordering::SeqCst) => {
+                let len = |at: usize| u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap());
+                let header = len(0) as usize;
+                disk.write_at(file, offset, &data[..header + len(header) as usize])?;
+                disk.sync_data(file)?;
+                unsynced.store(true, Ordering::SeqCst);
+                Err(zerodb_tape::Error::Io(
                     std::io::ErrorKind::Interrupted,
                     "torn checkpoint".into(),
-                ));
+                ))
             }
-            self.hit(self.disk.write_at(f, o, d))
-        }
-        fn read_at(&self, f: FileId, o: u64, d: &mut [u8]) -> zerodb_tape::Result<usize> {
-            self.hit(self.disk.read_at(f, o, d))
-        }
-        fn len(&self, f: FileId) -> zerodb_tape::Result<u64> {
-            self.hit(self.disk.len(f))
-        }
-        fn set_len(&self, f: FileId, n: u64) -> zerodb_tape::Result<()> {
-            self.hit(self.disk.set_len(f, n))
-        }
-        fn allocate(&self, f: FileId, n: u64) -> zerodb_tape::Result<()> {
-            self.hit(self.disk.allocate(f, n))
-        }
-        fn available_bytes(&self, dir: &Path) -> zerodb_tape::Result<u64> {
-            self.disk.available_bytes(dir)
-        }
-        fn total_bytes(&self, dir: &Path) -> zerodb_tape::Result<u64> {
-            self.disk.total_bytes(dir)
-        }
-        fn sync_data(&self, f: FileId) -> zerodb_tape::Result<()> {
-            self.hit(self.disk.sync_data(f))
-        }
-        fn sync_dir(&self, p: &Path) -> zerodb_tape::Result<()> {
-            if self.skip_cleanup_sync.swap(false, Ordering::SeqCst) {
-                return Err(zerodb_tape::Error::SyncFailed("unsynced cleanup removal".into()));
+            Op::SyncDir(_) if unsynced.swap(false, Ordering::SeqCst) => {
+                Err(zerodb_tape::Error::SyncFailed("unsynced cleanup removal".into()))
             }
-            self.hit(self.disk.sync_dir(p))
-        }
-        fn rename(&self, a: &Path, b: &Path) -> zerodb_tape::Result<()> {
-            let result = self.hit(self.disk.rename(a, b));
-            if result.is_ok() && self.capture_rename.swap(false, Ordering::SeqCst) {
-                *self.crashed.lock().unwrap() = Some(self.disk.crash()?);
-            }
-            result
-        }
-        fn remove(&self, p: &Path) -> zerodb_tape::Result<()> {
-            self.hit(self.disk.remove(p))
-        }
-        fn list(&self, p: &Path) -> zerodb_tape::Result<Vec<PathBuf>> {
-            self.hit(self.disk.list(p))
-        }
-        fn exists(&self, p: &Path) -> zerodb_tape::Result<bool> {
-            self.hit(self.disk.exists(p))
-        }
-        fn try_lock_exclusive(&self, p: &Path) -> zerodb_tape::Result<LockGuard> {
-            self.hit(self.disk.try_lock_exclusive(p))
-        }
+            _ => next(),
+        });
     }
+
+    /// Checkpoint data files created so far, by name.
+    fn created(events: &Mutex<Vec<String>>) -> Vec<String> {
+        let events = events.lock().unwrap();
+        events.iter().filter_map(|e| e.strip_prefix("create db/ckpt-")).map(str::to_owned).collect()
+    }
+
     #[test]
-    fn crash_at_each_checkpoint_install_operation_keeps_a_chain_or_requests_replay() {
+    fn crash_or_failure_at_each_install_operation_keeps_a_chain_or_requests_replay() {
         for seed in 0..16 {
             for at in 1..=20 {
                 let disk = SimDisk::new(seed);
@@ -1072,9 +1018,18 @@ mod tests {
                 append(&shared, 1);
                 save(&disk, Path::new("db"), &shared).unwrap();
                 append(&shared, 2);
-                let io = FaultIo::new(disk, at);
-                let _ = save(&io, Path::new("db"), &shared);
-                if let Some(crashed) = io.crashed.lock().unwrap().as_ref() {
+                let (io, image) = crash_at(disk, at);
+                let saved = save(&io, Path::new("db"), &shared);
+                // Data write and syncs, then metadata write and sync, before the ambiguous rename.
+                if [3, 4, 5, 7, 8].contains(&at) {
+                    let (disk, case) = (&io.inner, format!("seed {seed}, op {at}"));
+                    assert!(saved.is_err(), "{case}");
+                    assert!(!disk.exists(Path::new("db/ckpt-3-1.zdb")).unwrap(), "{case}");
+                    assert!(!disk.exists(Path::new("db/CHECKPOINT.next")).unwrap(), "{case}");
+                    let loaded = load_inner(disk, Path::new("db"), &EngineOptions::default());
+                    assert_eq!(loaded.unwrap().watermark, 2, "{case}: partial files removed");
+                }
+                if let Some(crashed) = image.lock().unwrap().as_ref() {
                     let loaded = load(crashed, Path::new("db"), &EngineOptions::default());
                     if loaded.watermark == 0 {
                         assert_eq!(loaded.warnings, 1, "seed {seed}, op {at}");
@@ -1090,38 +1045,6 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn checkpoint_delta_io_does_not_rewrite_unchanged_sessions() {
-        let disk = SimDisk::new(3);
-        let shared = state();
-        {
-            let mut state = shared.lock().unwrap();
-            for i in 0..100 {
-                let key = Key(1, "a".into(), i.to_string());
-                state.index.reserve(&key, 1).unwrap();
-                state.index.publish(&key, 1, i + 2).unwrap();
-                state.dirty.insert((key, 0));
-            }
-            state.published_lsn = 101;
-            state.txn = 100;
-        }
-        save(&disk, Path::new("db"), &shared).unwrap();
-        {
-            let mut state = shared.lock().unwrap();
-            let key = Key(1, "a".into(), "0".into());
-            state.index.reserve(&key, 1).unwrap();
-            state.index.publish(&key, 2, 102).unwrap();
-            state.dirty.insert((key, 0));
-            state.published_lsn = 102;
-            state.txn = 101;
-        }
-        save(&disk, Path::new("db"), &shared).unwrap();
-        let name = shared.lock().unwrap().chain.last().unwrap().name.clone();
-        let file = disk.open(&Path::new("db").join(name)).unwrap();
-        assert!(disk.len(file).unwrap() < 128);
-        disk.close(file).unwrap();
-    }
-
     #[test]
     fn large_full_snapshot_bounds_encoded_buffer() {
         let shared = state();
@@ -1158,9 +1081,16 @@ mod tests {
                 });
             }
         }
-        let io = FaultIo::new(SimDisk::new(30), usize::MAX);
+        let (io, writes) = (HookIo::sim(30), Arc::new(Mutex::new(Vec::new())));
+        let log = writes.clone();
+        io.add(move |op, next| {
+            if let Op::Write(_, _, offset, data) = op {
+                log.lock().unwrap().push((offset, data.len()));
+            }
+            next()
+        });
         save(&io, Path::new("db"), &shared).unwrap();
-        let writes = io.writes.lock().unwrap();
+        let writes = writes.lock().unwrap();
         assert!(writes.iter().map(|(_, len)| len).sum::<usize>() > 8 * 1024 * 1024);
         assert!(writes.iter().all(|(_, len)| *len <= 4 * 1024 * 1024), "{writes:?}");
         assert!(shared.lock().unwrap().checkpoint_buffer_peak <= BUFFER_LIMIT);
@@ -1180,75 +1110,65 @@ mod tests {
             "full checkpoint peak_buffer_bytes={} writes={writes:?}",
             shared.lock().unwrap().checkpoint_buffer_peak
         );
-        let loaded = load_inner(&io.disk, Path::new("db"), &EngineOptions::default()).unwrap();
+        let loaded = load_inner(&io.inner, Path::new("db"), &EngineOptions::default()).unwrap();
         assert_eq!(loaded.index.sessions.len(), 128);
         assert!(loaded.index.sessions.values().all(|entry| entry.len == 5000));
         assert_eq!(loaded.dedup.entries.len(), 10_000);
     }
 
     #[test]
-    fn legacy_unsealed_manifest_requests_full_replay() {
-        let disk = SimDisk::new(40);
-        let shared = state();
-        append(&shared, 1);
-        save(&disk, Path::new("db"), &shared).unwrap();
-        let name = shared.lock().unwrap().chain[0].name.clone();
-        let mut legacy = b"ZCM1".to_vec();
-        legacy.extend_from_slice(&2u64.to_le_bytes());
-        legacy.extend_from_slice(&1u64.to_le_bytes());
-        legacy.push(1);
-        bytes(&mut legacy, name.as_bytes());
-        let file = disk.open(Path::new("db/CHECKPOINT")).unwrap();
-        disk.set_len(file, 0).unwrap();
-        write(&disk, file, &mut 0, &legacy).unwrap();
-        disk.sync_data(file).unwrap();
-        disk.close(file).unwrap();
-        let loaded = load(&disk, Path::new("db"), &EngineOptions::default());
-        assert_eq!(loaded.warnings, 1);
-        assert_eq!(loaded.watermark, 0);
-    }
-
-    #[test]
-    fn manifest_rejects_valid_record_prefixes_and_crc_valid_replacements() {
-        for changed in 0..2 {
-            for truncate in [false, true] {
-                let disk = SimDisk::new(38);
-                let shared = state();
-                append(&shared, 1);
+    fn legacy_manifests_and_altered_chain_files_request_full_replay() {
+        // (chain file, truncate it), or None for a manifest in the unsealed legacy format.
+        for case in [Some((0, false)), Some((0, true)), Some((1, false)), Some((1, true)), None] {
+            let disk = SimDisk::new(38);
+            let shared = state();
+            for seq in 1..=2 {
+                append(&shared, seq);
                 save(&disk, Path::new("db"), &shared).unwrap();
-                append(&shared, 2);
-                save(&disk, Path::new("db"), &shared).unwrap();
-                let files = disk
-                    .list(Path::new("db"))
-                    .unwrap()
-                    .into_iter()
-                    .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("ckpt-"))
-                    .collect::<Vec<_>>();
-                let file = disk.open(&files[changed]).unwrap();
-                let mut data = vec![0; disk.len(file).unwrap() as usize];
-                assert_eq!(disk.read_at(file, 0, &mut data).unwrap(), data.len());
-                let mut offset = 0;
-                while data[offset + 8] != 2 {
-                    offset += u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap())
-                        as usize;
-                }
-                if truncate {
-                    disk.set_len(file, offset as u64).unwrap();
-                } else {
-                    let len = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap())
-                        as usize;
-                    let slot = offset + len - (changed + 1) * 8;
-                    data[slot..slot + 8].copy_from_slice(&1u64.to_le_bytes());
-                    let sum = crc(&data[offset + 4..offset + len]);
-                    data[offset..offset + 4].copy_from_slice(&sum.to_le_bytes());
-                    disk.write_at(file, 0, &data).unwrap();
-                }
+            }
+            let Some((changed, truncate)) = case else {
+                let mut legacy = b"ZCM1".to_vec();
+                legacy.extend_from_slice(&2u64.to_le_bytes());
+                legacy.extend_from_slice(&1u64.to_le_bytes());
+                legacy.push(1);
+                bytes(&mut legacy, shared.lock().unwrap().chain[0].name.as_bytes());
+                let file = disk.open(Path::new("db/CHECKPOINT")).unwrap();
+                disk.set_len(file, 0).unwrap();
+                write(&disk, file, &mut 0, &legacy).unwrap();
                 disk.sync_data(file).unwrap();
                 disk.close(file).unwrap();
                 let loaded = load(&disk, Path::new("db"), &EngineOptions::default());
-                assert_eq!(loaded.warnings, 1, "chain file {changed}, truncated={truncate}");
-                assert_eq!(loaded.watermark, 0);
+                assert_eq!((loaded.warnings, loaded.watermark), (1, 0), "legacy manifest");
+                continue;
+            };
+            let files = disk
+                .list(Path::new("db"))
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("ckpt-"))
+                .collect::<Vec<_>>();
+            let file = disk.open(&files[changed]).unwrap();
+            let mut data = vec![0; disk.len(file).unwrap() as usize];
+            assert_eq!(disk.read_at(file, 0, &mut data).unwrap(), data.len());
+            let len = |at: usize| u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap());
+            let mut offset = 0;
+            while data[offset + 8] != 2 {
+                offset += len(offset) as usize;
             }
+            if truncate {
+                disk.set_len(file, offset as u64).unwrap();
+            } else {
+                let end = offset + len(offset) as usize;
+                let slot = end - (changed + 1) * 8;
+                data[slot..slot + 8].copy_from_slice(&1u64.to_le_bytes());
+                let sum = crc(&data[offset + 4..end]);
+                data[offset..offset + 4].copy_from_slice(&sum.to_le_bytes());
+                disk.write_at(file, 0, &data).unwrap();
+            }
+            disk.sync_data(file).unwrap();
+            disk.close(file).unwrap();
+            let loaded = load(&disk, Path::new("db"), &EngineOptions::default());
+            assert_eq!((loaded.warnings, loaded.watermark), (1, 0), "{case:?}");
         }
     }
 
@@ -1256,28 +1176,14 @@ mod tests {
     fn failed_attempts_consume_names_and_counter_never_wraps() {
         let shared = state();
         append(&shared, 1);
-        let io = FaultIo::new(SimDisk::new(39), usize::MAX);
+        let io = HookIo::sim(39);
+        let events = io.record();
         for _ in 0..2 {
-            io.tear_write.store(true, Ordering::SeqCst);
+            tear_next_write(&io);
             assert!(save(&io, Path::new("db"), &shared).is_err());
         }
         save(&io, Path::new("db"), &shared).unwrap();
-        let names = io
-            .created
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("ckpt-"))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                PathBuf::from("db/ckpt-2.zdb"),
-                PathBuf::from("db/ckpt-2-1.zdb"),
-                PathBuf::from("db/ckpt-2-2.zdb"),
-            ]
-        );
+        assert_eq!(created(&events), ["2.zdb", "2-1.zdb", "2-2.zdb"]);
         assert_eq!(shared.lock().unwrap().checkpoint_attempt, 3);
         append(&shared, 2);
         shared.lock().unwrap().checkpoint_attempt = u64::MAX;
@@ -1292,28 +1198,19 @@ mod tests {
         for seed in 0..256 {
             let shared = state();
             append(&shared, 1);
-            let io = FaultIo::new(SimDisk::new(seed), usize::MAX);
-            io.tear_write.store(true, Ordering::SeqCst);
+            let io = HookIo::sim(seed);
+            let events = io.record();
+            tear_next_write(&io);
             assert!(save(&io, Path::new("db"), &shared).is_err());
-            assert!(!io.disk.exists(Path::new("db/ckpt-2.zdb")).unwrap());
-            io.capture_rename.store(true, Ordering::SeqCst);
+            assert!(!io.inner.exists(Path::new("db/ckpt-2.zdb")).unwrap());
+            let images = io.capture();
             save(&io, Path::new("db"), &shared).unwrap();
-            let created = io
-                .created
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("ckpt-"))
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(
-                created,
-                vec![PathBuf::from("db/ckpt-2.zdb"), PathBuf::from("db/ckpt-2-1.zdb")]
-            );
-            let image = io.crashed.lock().unwrap().take().unwrap();
+            assert_eq!(created(&events), ["2.zdb", "2-1.zdb"]);
+            let images = images.lock().unwrap();
+            let (_, image) = images.iter().find(|(op, _)| op.starts_with("rename")).unwrap();
             if image.exists(Path::new("db/CHECKPOINT")).unwrap() {
                 manifests += 1;
-                let loaded = load(&image, Path::new("db"), &EngineOptions::default());
+                let loaded = load(image, Path::new("db"), &EngineOptions::default());
                 if loaded.watermark == 2 {
                     assert_eq!(
                         loaded.index.sessions.get(&Key(1, "a".into(), "s".into())).map(|e| e.len),
@@ -1327,25 +1224,5 @@ mod tests {
             }
         }
         assert!(manifests > 0);
-    }
-
-    #[test]
-    fn failed_checkpoint_before_install_removes_partial_files() {
-        // Data write/syncs and metadata write/sync, before the ambiguous rename.
-        for at in [3, 4, 5, 7, 8] {
-            let disk = SimDisk::new(7);
-            let shared = state();
-            append(&shared, 1);
-            save(&disk, Path::new("db"), &shared).unwrap();
-            append(&shared, 2);
-            let io = FaultIo::new(disk, at);
-            assert!(save(&io, Path::new("db"), &shared).is_err());
-            assert!(!io.disk.exists(Path::new("db/ckpt-3-1.zdb")).unwrap(), "operation {at}");
-            assert!(!io.disk.exists(Path::new("db/CHECKPOINT.next")).unwrap(), "operation {at}");
-            assert_eq!(
-                load_inner(&io.disk, Path::new("db"), &EngineOptions::default()).unwrap().watermark,
-                2
-            );
-        }
     }
 }

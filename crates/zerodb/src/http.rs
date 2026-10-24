@@ -673,7 +673,7 @@ pub fn exchange<S: Stream + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::type_complexity)]
     use super::*;
     use proptest::prelude::*;
     use std::sync::{Arc, Mutex};
@@ -694,22 +694,17 @@ mod tests {
         write_errors: usize,
     }
 
-    fn deny(_: &Head) -> Result<(), Response> {
-        Err(Response::error(401, "unauthorized", None))
+    /// Refuses a request with an `X-Deny` header, as a failed auth check does.
+    fn check(head: &Head) -> Result<(), Response> {
+        match head.header("x-deny") {
+            Some(_) => Err(Response::error(401, "unauthorized", None)),
+            None => Ok(()),
+        }
     }
 
-    fn accept(_: &Head) -> Result<(), Response> {
-        Ok(())
-    }
-
-    /// Drives one server connection against a scripted client over a socket pair.
-    fn run(
-        limits: Limits,
-        steps: Vec<Step>,
-        check: fn(&Head) -> Result<(), Response>,
-        reply_bytes: usize,
-        client_reads: bool,
-    ) -> Run {
+    /// Drives one server connection against a scripted client over a socket pair. With
+    /// `unread`, each reply is 4 MiB and the client reads nothing until the server is done.
+    fn run(limits: Limits, steps: Vec<Step>, unread: bool) -> Run {
         let (server, client) = UnixStream::pair().unwrap();
         let wire = Arc::new(Mutex::new(Vec::new()));
         let (mut writer, seen) = (client.try_clone().unwrap(), wire.clone());
@@ -738,21 +733,18 @@ mod tests {
                 wire.lock().unwrap().extend_from_slice(&chunk[..n]);
             }
         };
-        let reader = client_reads.then(|| {
+        let reader = (!unread).then(|| {
             let (stream, wire) = (client.try_clone().unwrap(), wire.clone());
             thread::spawn(move || read_all(stream, wire))
         });
-        let start = Instant::now();
-        let mut conn = ServerConn::new(server, limits);
-        let mut bodies = Vec::new();
-        let mut write_errors = 0;
+        let (start, mut conn) = (Instant::now(), ServerConn::new(server, limits));
+        let (mut bodies, mut write_errors) = (Vec::new(), 0);
         while let Some((request, ())) = conn.next_request(check) {
             assert_eq!(request.body.len() as u64, request.head.content_length);
             bodies.push(request.body);
-            let reply = Response::text(200, "text/plain", "x".repeat(reply_bytes));
-            if conn.respond(&reply).is_err() {
-                write_errors += 1;
-            }
+            let reply = "x".repeat(if unread { 4 << 20 } else { 2 });
+            write_errors +=
+                conn.respond(&Response::text(200, "text/plain", reply)).is_err() as usize;
         }
         let elapsed = start.elapsed();
         drop(conn);
@@ -765,10 +757,17 @@ mod tests {
         Run { bodies, wire, elapsed, write_errors }
     }
 
-    fn statuses(wire: &str) -> Vec<u16> {
-        wire.match_indices("HTTP/1.1 ")
-            .filter_map(|(at, _)| wire.get(at + 9..at + 12)?.parse().ok())
-            .collect()
+    /// Each response on the wire as its status, `Connection` header and error name, if any.
+    fn responses(wire: &str) -> Vec<String> {
+        let response = |text: &str| {
+            let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
+            let connection = head.lines().find_map(|line| line.strip_prefix("Connection: "));
+            let error =
+                body.split_once(r#""error":""#).and_then(|(_, rest)| rest.split('"').next());
+            let fields = [text.get(..3), connection, error];
+            fields.into_iter().flatten().collect::<Vec<_>>().join(" ")
+        };
+        wire.split("HTTP/1.1 ").skip(1).map(response).collect()
     }
 
     fn send(text: &str) -> Vec<Step> {
@@ -784,325 +783,6 @@ mod tests {
         format!("GET / HTTP/1.1\r\n{lines}\r\n")
     }
 
-    struct Case {
-        name: &'static str,
-        input: fn() -> Vec<Step>,
-        limits: fn() -> Limits,
-        check: fn(&Head) -> Result<(), Response>,
-        reply_bytes: usize,
-        client_reads: bool,
-        bodies: &'static [&'static [u8]],
-        statuses: &'static [u16],
-        wire_has: &'static [&'static str],
-        write_errors: usize,
-        max_elapsed_ms: u64,
-    }
-
-    const BASE: Case = Case {
-        name: "",
-        input: Vec::new,
-        limits: relaxed,
-        check: accept,
-        reply_bytes: 2,
-        client_reads: true,
-        bodies: &[],
-        statuses: &[],
-        wire_has: &[],
-        write_errors: 0,
-        max_elapsed_ms: 10_000,
-    };
-
-    const CASES: &[Case] = &[
-        Case {
-            name: "get without body keeps the connection",
-            input: || send("GET /v1/window?session=s HTTP/1.1\r\nHost: localhost\r\n\r\n"),
-            bodies: &[b""],
-            statuses: &[200],
-            wire_has: &["Connection: keep-alive", "Content-Length: 2\r\n"],
-            ..BASE
-        },
-        Case {
-            name: "post with body",
-            input: || send("POST /v1/append HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"),
-            bodies: &[b"hello"],
-            statuses: &[200],
-            ..BASE
-        },
-        Case {
-            name: "pipelined requests on one connection",
-            input: || {
-                send("POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\noneGET / HTTP/1.1\r\n\r\nPOST / HTTP/1.1\r\nContent-Length: 3\r\n\r\ntwo")
-            },
-            bodies: &[b"one", b"", b"two"],
-            statuses: &[200, 200, 200],
-            ..BASE
-        },
-        Case {
-            name: "http/1.0 closes after one request",
-            input: || send("POST / HTTP/1.0\r\nContent-Length: 2\r\n\r\nhiGET / HTTP/1.1\r\n\r\n"),
-            bodies: &[b"hi"],
-            statuses: &[200],
-            wire_has: &["Connection: close"],
-            ..BASE
-        },
-        Case {
-            name: "connection close is honored",
-            input: || {
-                send(
-                    "GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\nGET / HTTP/1.1\r\n\r\n",
-                )
-            },
-            bodies: &[b""],
-            statuses: &[200],
-            wire_has: &["Connection: close"],
-            ..BASE
-        },
-        Case {
-            name: "expect 100-continue after the checks pass",
-            input: || {
-                let mut steps =
-                    send("POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n");
-                steps.extend([Step::Await("100 Continue"), Step::Send(b"body".to_vec())]);
-                steps
-            },
-            bodies: &[b"body"],
-            statuses: &[100, 200],
-            ..BASE
-        },
-        Case {
-            name: "get with zero length",
-            input: || send("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n"),
-            bodies: &[b""],
-            statuses: &[200],
-            ..BASE
-        },
-        Case {
-            name: "nineteen digit length",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: 0000000000000000003\r\n\r\nabc"),
-            bodies: &[b"abc"],
-            statuses: &[200],
-            ..BASE
-        },
-        Case {
-            name: "body exactly at the cap",
-            input: || {
-                send(&format!("POST / HTTP/1.1\r\nContent-Length: 64\r\n\r\n{}", "b".repeat(64)))
-            },
-            bodies: &[&[b'b'; 64]],
-            statuses: &[200],
-            ..BASE
-        },
-        Case {
-            name: "head and body sent one byte at a time",
-            input: || {
-                trickle(
-                    "\r\n\r\nPOST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
-                    0,
-                )
-            },
-            bodies: &[b"hello"],
-            statuses: &[200],
-            ..BASE
-        },
-        Case {
-            name: "head end split across reads",
-            input: || {
-                let mut steps = send("GET / HTTP/1.1\r\nX: a\r");
-                steps.extend([Step::Sleep(10), Step::Send(b"\n\r".to_vec())]);
-                steps.extend([Step::Sleep(10), Step::Send(b"\n".to_vec())]);
-                steps
-            },
-            bodies: &[b""],
-            statuses: &[200],
-            ..BASE
-        },
-        Case {
-            name: "sixty-four header lines",
-            input: || send(&header_lines(64)),
-            bodies: &[b""],
-            statuses: &[200],
-            ..BASE
-        },
-        Case {
-            name: "transfer-encoding is not implemented",
-            input: || {
-                send("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
-            },
-            statuses: &[501],
-            wire_has: &["Connection: close", "\"error\":\"not_implemented\""],
-            ..BASE
-        },
-        Case {
-            name: "duplicate content-length",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"),
-            statuses: &[400],
-            wire_has: &["Connection: close", "\"outcome\":\"not_committed\""],
-            ..BASE
-        },
-        Case {
-            name: "duplicate host",
-            input: || send("GET / HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\n\r\n"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "obs-fold",
-            input: || send("GET / HTTP/1.1\r\nX-A: a\r\n b\r\n\r\n"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "body on get",
-            input: || send("GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "length with a sign",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "negative length",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "length list",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: 3, 3\r\n\r\nabc"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "length with inner space",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: 1 2\r\n\r\nabc"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "twenty digit length",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: 00000000000000000003\r\n\r\nabc"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "head over 16 KiB",
-            input: || send(&format!("GET / HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "a".repeat(16 * 1024))),
-            statuses: &[431],
-            ..BASE
-        },
-        Case {
-            name: "16 KiB without a line break",
-            input: || send(&format!("GET /{}", "a".repeat(16 * 1024))),
-            statuses: &[431],
-            ..BASE
-        },
-        Case {
-            name: "sixty-five header lines",
-            input: || send(&header_lines(65)),
-            statuses: &[431],
-            ..BASE
-        },
-        Case {
-            name: "body over the cap closes unread and skips 100-continue",
-            input: || send("POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 65\r\n\r\n"),
-            statuses: &[413],
-            wire_has: &[
-                "Connection: close",
-                "{\"error\":\"too_large\",\"outcome\":\"not_committed\"}",
-            ],
-            ..BASE
-        },
-        Case {
-            name: "failed check closes unread and skips 100-continue",
-            input: || send("POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 64\r\n\r\n"),
-            check: deny,
-            statuses: &[401],
-            wire_has: &["Connection: close", "\"error\":\"unauthorized\""],
-            ..BASE
-        },
-        Case {
-            name: "malformed request line",
-            input: || send("GARBAGE\r\n\r\n"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "unsupported version",
-            input: || send("GET / HTTP/2.0\r\n\r\n"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case {
-            name: "unknown expectation",
-            input: || send("POST / HTTP/1.1\r\nExpect: something\r\nContent-Length: 1\r\n\r\nx"),
-            statuses: &[417],
-            ..BASE
-        },
-        Case {
-            name: "no keep-alive after a framing error",
-            input: || send("GET / HTTP/1.1\r\nContent-Length: 1\r\n\r\nxGET / HTTP/1.1\r\n\r\n"),
-            statuses: &[400],
-            ..BASE
-        },
-        Case { name: "truncated head", input: || send("GET / HTTP/1.1\r\nHost"), ..BASE },
-        Case {
-            name: "truncated body",
-            input: || send("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc"),
-            ..BASE
-        },
-        Case {
-            name: "slow head hits the total head deadline",
-            limits: || Limits { head_timeout: SHORT, ..relaxed() },
-            input: || {
-                trickle(
-                    "GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow: aaaaaaaaaaaaaaaaaaaa\r\n\r\n",
-                    10,
-                )
-            },
-            max_elapsed_ms: 500,
-            ..BASE
-        },
-        Case {
-            name: "slow body hits the total body deadline",
-            limits: || Limits { body_timeout: SHORT, ..relaxed() },
-            input: || {
-                let mut steps = send("POST / HTTP/1.1\r\nContent-Length: 60\r\n\r\n");
-                steps.extend(trickle(&"b".repeat(60), 10));
-                steps
-            },
-            max_elapsed_ms: 500,
-            ..BASE
-        },
-        Case {
-            name: "idle keep-alive hits the idle deadline",
-            limits: || Limits { idle_timeout: SHORT, ..relaxed() },
-            input: || {
-                let mut steps = send("GET / HTTP/1.1\r\n\r\n");
-                steps.push(Step::Sleep(800));
-                steps
-            },
-            bodies: &[b""],
-            statuses: &[200],
-            max_elapsed_ms: 500,
-            ..BASE
-        },
-        Case {
-            name: "unread response hits the write deadline",
-            limits: || Limits { write_timeout: SHORT, ..relaxed() },
-            input: || send("GET / HTTP/1.1\r\n\r\n"),
-            reply_bytes: 4 << 20,
-            client_reads: false,
-            bodies: &[b""],
-            statuses: &[200],
-            write_errors: 1,
-            max_elapsed_ms: 500,
-            ..BASE
-        },
-    ];
-
     /// The published deadlines. A case about one deadline shortens only that one to
     /// [`SHORT`], so a thread delayed under load cannot fail it on another deadline.
     fn relaxed() -> Limits {
@@ -1113,43 +793,131 @@ mod tests {
 
     #[test]
     fn framing_accepts_and_rejects() {
+        let get = |rest: &str| send(&format!("GET / HTTP/1.1\r\n{rest}"));
+        let post = |rest: &str| send(&format!("POST / HTTP/1.1\r\n{rest}"));
+        let mut continued = post("Expect: 100-continue\r\nContent-Length: 4\r\n\r\n");
+        continued.extend([Step::Await("100 Continue"), Step::Send(b"body".to_vec())]);
+        let mut split = get("X: a\r");
+        split.extend([Step::Sleep(10), Step::Send(b"\n\r".to_vec())]);
+        split.extend([Step::Sleep(10), Step::Send(b"\n".to_vec())]);
+        let pipelined = "Content-Length: 3\r\n\r\noneGET / HTTP/1.1\r\n\r\nPOST / HTTP/1.1\r\n\
+                         Content-Length: 3\r\n\r\ntwo";
+        let one_by_one = "\r\n\r\nPOST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+        let http10 = send("POST / HTTP/1.0\r\nContent-Length: 2\r\n\r\nhiGET / HTTP/1.1\r\n\r\n");
+        let over_cap = "Expect: 100-continue\r\nContent-Length: 65\r\n\r\n";
+        let denied = format!("X-Deny: 1\r\n{}", over_cap.replace("65", "64"));
+        let (closing, again) = ("Connection: keep-alive, close\r\n\r\n", "GET / HTTP/1.1\r\n\r\n");
+        let (chunked, expect) = (&["501 close not_implemented"], &["417 close expectation_failed"]);
+        let (pad, large_head) = ("a".repeat(16 * 1024), &["431 close headers_too_large"]);
+        let at_cap = post(&format!("Content-Length: 64\r\n\r\n{}", "b".repeat(64)));
+        let (close, keep, bad) = (&["200 close"], &["200 keep-alive"], &["400 close bad_request"]);
+        // (case, client steps, each response as `<status> <Connection> <error>`, request bodies)
+        let cases: Vec<(&str, Vec<Step>, &[&str], &[&[u8]])> = vec![
+            ("get keeps the connection", get("Host: a\r\n\r\n"), keep, &[b""]),
+            ("post with body", post("Content-Length: 5\r\n\r\nhello"), keep, &[b"hello"]),
+            ("pipelined requests", post(pipelined), &["200 keep-alive"; 3], &[b"one", b"", b"two"]),
+            ("http/1.0 closes after one request", http10, close, &[b"hi"]),
+            ("connection close is honored", get(&format!("{closing}{again}")), close, &[b""]),
+            (
+                "100-continue after the checks pass",
+                continued,
+                &["100", "200 keep-alive"],
+                &[b"body"],
+            ),
+            ("get with zero length", get("Content-Length: 0\r\n\r\n"), keep, &[b""]),
+            (
+                "19 digit length",
+                post("Content-Length: 0000000000000000003\r\n\r\nabc"),
+                keep,
+                &[b"abc"],
+            ),
+            ("body at the cap", at_cap, keep, &[&[b'b'; 64]]),
+            ("one byte at a time", trickle(one_by_one, 0), keep, &[b"hello"]),
+            ("head end split across reads", split, keep, &[b""]),
+            ("64 header lines", send(&header_lines(64)), keep, &[b""]),
+            ("transfer-encoding", post("Transfer-Encoding: chunked\r\n\r\n"), chunked, &[]),
+            ("two lengths", post("Content-Length: 1\r\nContent-Length: 1\r\n\r\nx"), bad, &[]),
+            ("duplicate host", get("Host: localhost\r\nHost: evil.example\r\n\r\n"), bad, &[]),
+            ("obs-fold", get("X-A: a\r\n b\r\n\r\n"), bad, &[]),
+            ("body on get", get("Content-Length: 3\r\n\r\nabc"), bad, &[]),
+            ("length with a sign", post("Content-Length: +3\r\n\r\nabc"), bad, &[]),
+            ("negative length", post("Content-Length: -1\r\n\r\n"), bad, &[]),
+            ("length list", post("Content-Length: 3, 3\r\n\r\nabc"), bad, &[]),
+            ("length with inner space", post("Content-Length: 1 2\r\n\r\nabc"), bad, &[]),
+            ("20 digit length", post("Content-Length: 00000000000000000003\r\n\r\n"), bad, &[]),
+            ("head over 16 KiB", get(&format!("X-Pad: {pad}\r\n\r\n")), large_head, &[]),
+            ("16 KiB without a line break", send(&format!("GET /{pad}")), large_head, &[]),
+            ("65 header lines", send(&header_lines(65)), large_head, &[]),
+            ("body over the cap skips 100-continue", post(over_cap), &["413 close too_large"], &[]),
+            ("failed check skips 100-continue", post(&denied), &["401 close unauthorized"], &[]),
+            ("malformed request line", send("GARBAGE\r\n\r\n"), bad, &[]),
+            ("unsupported version", send("GET / HTTP/2.0\r\n\r\n"), bad, &[]),
+            ("unknown expectation", post("Expect: x\r\nContent-Length: 1\r\n\r\nx"), expect, &[]),
+            (
+                "no keep-alive after an error",
+                get(&format!("Content-Length: 1\r\n\r\nx{again}")),
+                bad,
+                &[],
+            ),
+            ("truncated head", get("Host"), &[], &[]),
+            ("truncated body", post("Content-Length: 10\r\n\r\nabc"), &[], &[]),
+        ];
+        for (case, steps, expected, bodies) in cases {
+            let run = run(relaxed(), steps, false);
+            assert_eq!(responses(&run.wire), expected, "{case}: responses");
+            assert_eq!(run.bodies, bodies, "{case}: bodies");
+            // Each error answers before the body and says nothing was written.
+            let errors = run.wire.matches(r#""error":"#).count();
+            assert_eq!(run.wire.matches(r#""outcome":"not_committed""#).count(), errors, "{case}");
+            assert!(run.elapsed < Duration::from_secs(10), "{case}: took {:?}", run.elapsed);
+        }
+        // The client refuses a line break inside a field before it writes anything.
+        let injected = [("Host", "localhost\r\nX-Evil: 1")];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error =
+            exchange(&mut UnixStream::pair().unwrap().0, "GET", "/", &injected, b"", deadline, 1)
+                .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "header injection is refused");
+    }
+
+    #[test]
+    fn deadlines_cut_off_slow_peers() {
         let defaults = Limits::default();
-        assert_eq!(
-            (defaults.head_bytes, defaults.header_lines, defaults.body_bytes),
-            (16 * 1024, 64, 8 << 20),
-            "published limits"
-        );
-        assert_eq!(
-            [
-                defaults.head_timeout,
-                defaults.body_timeout,
-                defaults.idle_timeout,
-                defaults.write_timeout
-            ],
-            [10, 30, 30, 30].map(Duration::from_secs),
-            "published deadlines"
-        );
-        for case in CASES {
-            let run = run(
-                (case.limits)(),
-                (case.input)(),
-                case.check,
-                case.reply_bytes,
-                case.client_reads,
+        let sizes = (defaults.head_bytes, defaults.header_lines, defaults.body_bytes);
+        assert_eq!(sizes, (16 * 1024, 64, 8 << 20), "published limits");
+        let deadlines = [
+            defaults.head_timeout,
+            defaults.body_timeout,
+            defaults.idle_timeout,
+            defaults.write_timeout,
+        ];
+        assert_eq!(deadlines, [10, 30, 30, 30].map(Duration::from_secs), "published deadlines");
+        let head =
+            trickle("GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow: aaaaaaaaaaaaaaaaaa\r\n\r\n", 10);
+        let mut body = send("POST / HTTP/1.1\r\nContent-Length: 60\r\n\r\n");
+        body.extend(trickle(&"b".repeat(60), 10));
+        let mut idle = send("GET / HTTP/1.1\r\n\r\n");
+        idle.push(Step::Sleep(800));
+        let (get, keep) = (send("GET / HTTP/1.1\r\n\r\n"), &["200 keep-alive"]);
+        // (case, the deadline set to SHORT, client steps, responses, reply left unread)
+        let cases: [(&str, fn(&mut Limits), Vec<Step>, &[&str], bool); 4] = [
+            ("slow head", |l| l.head_timeout = SHORT, head, &[], false),
+            ("slow body", |l| l.body_timeout = SHORT, body, &[], false),
+            ("idle keep-alive", |l| l.idle_timeout = SHORT, idle, keep, false),
+            ("unread response", |l| l.write_timeout = SHORT, get, keep, true),
+        ];
+        for (case, shorten, steps, expected, unread) in cases {
+            let mut limits = relaxed();
+            shorten(&mut limits);
+            let run = run(limits, steps, unread);
+            assert_eq!(responses(&run.wire), expected, "{case}");
+            let counts = (run.bodies.len(), run.write_errors);
+            assert_eq!(
+                counts,
+                (expected.len(), usize::from(unread)),
+                "{case}: bodies, write errors"
             );
-            let bodies: Vec<&[u8]> = run.bodies.iter().map(Vec::as_slice).collect();
-            assert_eq!(bodies, case.bodies, "{}: bodies", case.name);
-            assert_eq!(statuses(&run.wire), case.statuses, "{}: statuses", case.name);
-            for needle in case.wire_has {
-                assert!(run.wire.contains(needle), "{}: wire lacks {needle:?}", case.name);
-            }
-            assert_eq!(run.write_errors, case.write_errors, "{}: write errors", case.name);
-            assert!(
-                run.elapsed < Duration::from_millis(case.max_elapsed_ms),
-                "{}: took {:?}",
-                case.name,
-                run.elapsed
-            );
+            assert!(run.elapsed < Duration::from_millis(500), "{case}: took {:?}", run.elapsed);
         }
     }
 
@@ -1169,28 +937,6 @@ mod tests {
         thread::sleep(short);
         drop(alone);
         assert!(waiter.join().unwrap(), "a waiter gets room once it is freed");
-    }
-
-    #[test]
-    fn client_reads_one_response_over_a_socket() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let server = thread::spawn(move || {
-            let mut conn = ServerConn::new(server, relaxed());
-            let (request, ()) = conn.next_request(accept).unwrap();
-            let reply = json!({"echo": String::from_utf8(request.body).unwrap()});
-            conn.respond(&Response::json(200, &reply)).unwrap();
-            assert!(conn.next_request(accept).is_none(), "client asked to close");
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let headers = [("Host", "localhost")];
-        let response =
-            exchange(&mut client, "POST", "/v1/append", &headers, b"hi", deadline, 1024).unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, br#"{"echo":"hi"}"#);
-        server.join().unwrap();
-        let injected = [("Host", "localhost\r\nX-Evil: 1")];
-        let error = exchange(&mut client, "GET", "/", &injected, b"", deadline, 1024).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput, "header injection is refused");
     }
 
     fn vocabulary() -> impl Strategy<Value = Vec<u8>> {
@@ -1237,7 +983,7 @@ mod tests {
             input in prop_oneof![prop::collection::vec(any::<u8>(), 0..2048), vocabulary(), framed()],
         ) {
             let limits = Limits { body_bytes: 32, linger: Duration::ZERO, ..Limits::default() };
-            let run = run(limits, vec![Step::Send(input)], accept, 2, true);
+            let run = run(limits, vec![Step::Send(input)], false);
             for body in &run.bodies {
                 prop_assert!(body.len() <= 32, "body of {} bytes", body.len());
             }

@@ -1,631 +1,411 @@
-use crate::support::wire::*;
-use crate::support::wire::{damage, empty_footer, Damage};
-use crate::support::{opts, record, submit};
-use std::sync::atomic::Ordering;
+use crate::support::wire::{damage, setup, transaction, write, Damage};
+use crate::support::*;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use zerodb_tape::sim::frame::{self, Kind};
-use zerodb_tape::sim::{recover, DataDir};
-use zerodb_tape::sim::{SimClock, WriterCore};
-use zerodb_tape::Durability;
-use zerodb_tape::Error;
-use zerodb_tape::Tape;
-use zerodb_tape::{Io, SimDisk};
+use zerodb_tape::sim::{recover, DataDir, SimClock, WriterCore};
+use zerodb_tape::{Committed, Error, HookIo, Io, NoopStateMachine, SimDisk, Tape};
 
-use crate::support;
+/// Transactions chained from segment 1, offset 0.
+fn chain(txns: &[(u64, u64)]) -> Vec<u8> {
+    let mut at = (1, 0);
+    txns.iter()
+        .flat_map(|&(lsn, txn)| {
+            let (bytes, next) = transaction(lsn, txn, at);
+            at = next;
+            bytes
+        })
+        .collect()
+}
 
-#[test]
-fn oversized_padding_respects_the_durable_boundary() {
-    for (case, floor, partial_header, expect_corruption) in [
-        ("proved gap", 2, false, true),
-        ("unproved tail", 0, false, false),
-        ("proved partial length", 2, true, true),
-        ("unproved partial length", 0, true, false),
-    ] {
-        eprintln!("case: {case}");
-        let io = Arc::new(SimDisk::new(0));
-        let size = (frame::MAX_FRAME_SIZE + frame::HEADER_LEN + 44 + 1024) as u64;
-        let mut dir = DataDir::open(io.clone(), "db", None, size).unwrap();
-        for _ in 0..2 {
-            dir.prepare_next_segment(size).unwrap();
-        }
-        let (first, _) = transaction(1, 1, (1, 0));
-        let (mut last, _) = transaction(2, 2, (2, 0));
-        if partial_header {
-            last[..4].fill(0);
-            last.truncate(8);
-        }
-        write(&io, &dir, 1, 0, &first);
-        write(&io, &dir, 2, 0, &last);
-        dir.install_superblock(floor).unwrap();
-        let result = recover(&mut dir, size);
-        if expect_corruption {
-            assert!(matches!(result, Err(Error::CorruptionDetected { .. })), "{case}");
-        } else {
-            let report = result.unwrap().report;
-            assert_eq!(report.records, 1, "{case}");
-            assert!(report.truncated.is_some(), "{case}: nonzero tails are never unused");
-            assert_eq!(dir.segments(), &[1], "{case}");
-            dir.install_superblock(1).unwrap();
-            drop(dir);
-            for reopen in 0..2 {
-                let mut dir = DataDir::open(io.clone(), "db", None, size).unwrap();
-                assert_eq!(
-                    recover(&mut dir, size).unwrap().report.records,
-                    1,
-                    "{case}, reopen={reopen}"
-                );
-            }
-        }
+fn gap(io: &SimDisk, dir: &mut DataDir) {
+    two_segments(io, dir, false);
+}
+
+fn partial(io: &SimDisk, dir: &mut DataDir) {
+    two_segments(io, dir, true);
+}
+
+/// Transaction 1 in segment 1, then transaction 2 or its first 8 bytes in a new segment 2.
+fn two_segments(io: &SimDisk, dir: &mut DataDir, partial_header: bool) {
+    dir.prepare_next_segment(dir.segment_size()).unwrap();
+    let (mut last, _) = transaction(2, 2, (2, 0));
+    if partial_header {
+        last[..4].fill(0);
+        last.truncate(8);
     }
+    write(io, 1, 0, &chain(&[(1, 1)]));
+    write(io, 2, 0, &last);
 }
 
-#[test]
-fn clean_reopen_checks_dense_lsns() {
-    let (io, mut dir) = setup();
-    let (first, head) = transaction(1, 1, (1, 0));
-    let (second, _) = transaction(2, 2, head);
-    write(&io, &dir, 1, 0, &[first, second].concat());
-    dir.install_superblock(2).unwrap();
-    let recovered = recover(&mut dir, 1024).unwrap();
-    assert_eq!(recovered.report.durable_lsn, 2);
-    assert_eq!(recovered.report.records, 2);
-    assert!(recovered.report.truncated.is_none());
+/// Transaction 1 with one footer field flipped and its checksum still valid.
+fn bad_footer(io: &SimDisk, field: usize) {
+    let bytes = chain(&[(1, 1)]);
+    let used = frame::decode(&bytes, 1, 0).unwrap().1;
+    let (mut end, _) = frame::decode(&bytes[used..], 1, used as u64).unwrap();
+    end.payload[field] ^= 1;
+    write(io, 1, 0, &[&bytes[..used], &frame::encode(&end, 1, used as u64).unwrap()].concat());
 }
 
-#[test]
-fn lsn_gaps_cannot_bypass_dense_recovery() {
-    for (case, superblock, expect_corruption) in
-        [("unproved gap", 0, false), ("proved gap", u64::MAX, true)]
-    {
-        eprintln!("case: {case}");
-        let (io, mut dir) = setup();
-        let second = dir.prepare_next_segment(1024).unwrap();
-        let (valid, _) = transaction(u64::MAX, 1, (1, 0));
-        write(&io, &dir, 1, 0, &valid);
-        dir.install_superblock(superblock).unwrap();
-        let file = io.open(&dir.segment_path(second)).unwrap();
-        io.set_len(file, 1025).unwrap();
-        io.sync_data(file).unwrap();
-        io.close(file).unwrap();
-        let result = recover(&mut dir, 1024);
-        if expect_corruption {
-            assert!(matches!(result, Err(Error::CorruptionDetected { lsn: 1, .. })), "{case}");
-        } else {
-            let report = result.unwrap().report;
-            assert_eq!(report.durable_lsn, 0, "{case}");
-            assert!(report.truncated.is_some(), "{case}");
-        }
-    }
+fn chained(io: &SimDisk, txns: &[(u64, u64)]) {
+    write(io, 1, 0, &chain(txns));
 }
 
-#[test]
-fn missing_footer_drops_whole_transaction_and_zeroes_tail() {
-    let (io, mut dir) = setup();
-    let (first, head) = transaction(1, 1, (1, 0));
-    let (second, _) = transaction(2, 2, head);
-    write(&io, &dir, 1, 0, &first);
-    write(&io, &dir, 1, first.len() as u64, &second[..second.len() - 10]);
-    let recovered = recover(&mut dir, 1024).unwrap();
-    assert_eq!(recovered.report.durable_lsn, 1);
-    assert_eq!(recovered.report.truncated.as_ref().unwrap().0, 2..=2);
-    let crash = io.crash().unwrap();
-    let file = crash.open(&dir.segment_path(1)).unwrap();
-    let mut tail = vec![1; 1024 - first.len()];
-    crash.read_at(file, first.len() as u64, &mut tail).unwrap();
-    crash.close(file).unwrap();
-    assert!(tail.iter().all(|&byte| byte == 0));
+/// Transaction 1, then transaction 2 without its last 10 bytes.
+fn torn(io: &SimDisk) {
+    let bytes = chain(&[(1, 1), (2, 2)]);
+    write(io, 1, 0, &bytes[..bytes.len() - 10]);
 }
 
-#[test]
-fn damage_missing_segment_and_early_end_below_superblock_are_corruption() {
-    enum Fault {
-        RecordDamage,
-        MissingSegment,
-        EarlyEnd,
-    }
-    for (case, fault) in [
-        ("record damage", Fault::RecordDamage),
-        ("missing segment", Fault::MissingSegment),
-        ("early end", Fault::EarlyEnd),
-    ] {
-        eprintln!("case: {case}");
-        let (io, mut dir) = setup();
-        let (bytes, _) = transaction(1, 1, (1, 0));
-        write(&io, &dir, 1, 0, &bytes);
-        dir.install_superblock(1).unwrap();
-        match fault {
-            Fault::RecordDamage => {
-                let file = io.open(&dir.segment_path(1)).unwrap();
-                io.flip_bit(file, 105).unwrap();
-                io.close(file).unwrap();
-            }
-            Fault::MissingSegment => io.remove(&dir.segment_path(1)).unwrap(),
-            Fault::EarlyEnd => write(&io, &dir, 1, 0, &[0; 8]),
-        }
-        assert!(matches!(recover(&mut dir, 1024), Err(Error::CorruptionDetected { .. })), "{case}");
-    }
+fn duplicate(io: &SimDisk, _: &mut DataDir) {
+    chained(io, &[(1, 1), (1, 2)]);
 }
 
-#[test]
-fn bad_footer_binding_is_not_replayed() {
-    for (case, field) in [
-        ("first LSN binding", 8),
-        ("synced LSN equals the first record", 16),
-        ("records checksum", 28),
-    ] {
-        eprintln!("case: {case}");
-        let (io, mut dir) = setup();
-        let (bytes, _) = transaction(1, 1, (1, 0));
-        let (record, used) = frame::decode(&bytes, 1, 0).unwrap();
-        let (mut end, _) = frame::decode(&bytes[used..], 1, used as u64).unwrap();
-        end.payload[field] ^= 1;
-        let bytes =
-            [frame::encode(&record, 1, 0).unwrap(), frame::encode(&end, 1, used as u64).unwrap()]
-                .concat();
-
-        write(&io, &dir, 1, 0, &bytes);
-        let result = recover(&mut dir, 1024).unwrap();
-        assert_eq!(result.report.records, 0, "{case}");
-        assert!(result.report.truncated.is_some(), "{case}");
-    }
+fn lsn_gap(io: &SimDisk, dir: &mut DataDir) {
+    let second = dir.prepare_next_segment(1024).unwrap();
+    write(io, 1, 0, &transaction(u64::MAX, 1, (1, 0)).0);
+    let file = io.open(&dir.segment_path(second)).unwrap();
+    io.set_len(file, 1025).unwrap();
+    io.sync_data(file).unwrap();
+    io.close(file).unwrap();
 }
 
-#[test]
-fn nonincreasing_lsn_is_truncated_above_and_corruption_below_boundary() {
-    for (case, boundary, expect_corruption) in
-        [("unproved duplicate", 0, false), ("proved duplicate", 2, true)]
-    {
-        eprintln!("case: {case}");
-        let (io, mut dir) = setup();
-        let (first, head) = transaction(1, 1, (1, 0));
-        let (second, _) = transaction(1, 2, head);
-        write(&io, &dir, 1, 0, &[first, second].concat());
-        dir.install_superblock(boundary).unwrap();
-        let result = recover(&mut dir, 1024);
-        if expect_corruption {
-            assert!(matches!(result, Err(Error::CorruptionDetected { .. })), "{case}");
-        } else {
-            assert_eq!(result.unwrap().report.records, 1, "{case}");
-        }
-    }
+fn flipped(io: &SimDisk) {
+    chained(io, &[(1, 1)]);
+    let file = io.open(&seg(1)).unwrap();
+    io.flip_bit(file, 105).unwrap();
+    io.close(file).unwrap();
 }
 
-#[test]
-fn truncation_report_includes_discarded_later_segments() {
-    let (io, mut dir) = setup();
-    let (first, head) = transaction(1, 1, (1, 0));
-    let (second, _) = transaction(2, 2, head);
-    let (third, _) = transaction(3, 3, (2, 0));
+fn later_segments(io: &SimDisk, dir: &mut DataDir) {
     dir.prepare_next_segment(1024).unwrap();
-    write(&io, &dir, 1, 0, &first);
-    write(&io, &dir, 1, first.len() as u64, &second[..second.len() - 10]);
-    write(&io, &dir, 2, 0, &third);
-    let state = recover(&mut dir, 1024).unwrap();
-    assert_eq!(state.report.truncated.unwrap().0, 2..=3);
+    torn(io);
+    write(io, 2, 0, &transaction(3, 3, (2, 0)).0);
+}
+
+type Prepare = fn(&SimDisk, &mut DataDir);
+/// Recovered durable LSN and truncated LSNs, or the corrupt LSN.
+type Expect = Result<(u64, Option<RangeInclusive<u64>>), u64>;
+
+#[test]
+fn recovery_keeps_proved_records_and_truncates_unproved_tails() {
+    let big = (frame::MAX_FRAME_SIZE + frame::HEADER_LEN + 44 + 1024) as u64;
+    let cases: [(&str, u64, u64, Prepare, Expect); 17] = [
+        ("dense LSNs", 1024, 2, |io, _| chained(io, &[(1, 1), (2, 2)]), Ok((2, None))),
+        ("proved oversized gap", big, 2, gap, Err(2)),
+        ("unproved oversized tail", big, 0, gap, Ok((1, Some(2..=2)))),
+        ("proved partial length", big, 2, partial, Err(2)),
+        ("unproved partial length", big, 0, partial, Ok((1, Some(2..=2)))),
+        ("unproved LSN gap", 1024, 0, lsn_gap, Ok((0, Some(1..=u64::MAX)))),
+        ("proved LSN gap", 1024, u64::MAX, lsn_gap, Err(1)),
+        ("missing footer", 1024, 0, |io, _| torn(io), Ok((1, Some(2..=2)))),
+        ("record damage", 1024, 1, |io, _| flipped(io), Err(1)),
+        ("missing segment", 1024, 1, |io, _| io.remove(&seg(1)).unwrap(), Err(1)),
+        ("early end", 1024, 1, |io, _| write(io, 1, 0, &[0; 8]), Err(1)),
+        ("first LSN binding", 1024, 0, |io, _| bad_footer(io, 8), Ok((0, Some(1..=1)))),
+        ("synced LSN binding", 1024, 0, |io, _| bad_footer(io, 16), Ok((0, Some(1..=1)))),
+        ("records checksum", 1024, 0, |io, _| bad_footer(io, 28), Ok((0, Some(1..=1)))),
+        ("unproved duplicate", 1024, 0, duplicate, Ok((1, Some(2..=2)))),
+        ("proved duplicate", 1024, 2, duplicate, Err(2)),
+        ("discarded later segments", 1024, 0, later_segments, Ok((1, Some(2..=3)))),
+    ];
+    for (case, size, superblock, prepare, expected) in cases {
+        let io = Arc::new(SimDisk::new(1));
+        let mut dir = DataDir::open(io.clone(), "db", None, size).unwrap();
+        dir.prepare_next_segment(size).unwrap();
+        prepare(&io, &mut dir);
+        dir.install_superblock(superblock).unwrap();
+        let actual = match recover(&mut dir, size) {
+            Ok(state) => {
+                assert_eq!(state.report.segments, 1, "{case}: later segments removed");
+                Ok((state.report.durable_lsn, state.report.truncated.map(|(range, _)| range)))
+            }
+            Err(Error::CorruptionDetected { lsn, .. }) => Err(lsn),
+            Err(error) => panic!("{case}: {error}"),
+        };
+        assert_eq!(actual, expected, "{case}");
+        let Ok((durable, _)) = actual else { continue };
+        // Repairs are durable. Two later opens see a clean tail behind the new boundary.
+        dir.install_superblock(durable).unwrap();
+        drop(dir);
+        let crash = image(&io);
+        for reopen in 0..2 {
+            let mut dir = DataDir::open(crash.clone(), "db", None, size).unwrap();
+            let report = recover(&mut dir, size).unwrap().report;
+            let state = (report.durable_lsn, report.segments, report.truncated);
+            assert_eq!(state, (durable, 1, None), "{case}, reopen={reopen}");
+        }
+    }
 }
 
 #[test]
 fn truncation_resumes_at_the_cut_and_reopens_twice_after_new_ack() {
-    use zerodb_tape::sim::{SimClock, WriterCore};
-    use zerodb_tape::{Committed, Durability, RecordInput, TapeOptions as Options};
-    for count in [3, 5] {
-        eprintln!("case: count={count:?}");
-        for empty in [false, true] {
-            eprintln!("case: empty={empty:?}");
-            for offset_zero in [false, true] {
-                eprintln!("case: offset_zero={offset_zero:?}");
-                if empty && !offset_zero {
-                    continue;
-                }
-                let (io, mut dir) = setup();
-                for _ in 1..count {
-                    dir.prepare_next_segment(1024).unwrap();
-                }
-                let (first, _) = transaction(1, 1, (1, 0));
-                write(&io, &dir, 1, 0, &first);
-                dir.install_superblock(1).unwrap();
-                let mut last = 1;
-                let mut cut = 0;
-                if !offset_zero {
-                    let (prefix, _) = transaction(2, 2, (2, 0));
-                    write(&io, &dir, 2, 0, &prefix);
-                    cut = prefix.len() as u64;
-                    last = 2;
-                }
-                if !empty {
-                    write(&io, &dir, 2, cut, &[1; 8]);
-                }
-                for id in 3..=count {
-                    let (bytes, _) = transaction(last + id - 2, id, (id, 0));
-                    let file = io.open(&dir.segment_path(id)).unwrap();
-                    io.write_at(file, 0, &bytes).unwrap();
-                    io.close(file).unwrap();
-                }
-                drop(dir);
-                let opts = Options { segment_size: 1024, ..Options::default() };
-                let clock = Arc::new(SimClock::new(0));
-                let (mut core, report) =
-                    WriterCore::open(io.clone(), clock.clone(), "db", opts.clone()).unwrap();
-                assert_eq!(report.durable_lsn, last, "count={count} empty={empty} cut={cut}");
-                assert_eq!(report.segments, 2);
-                assert!(report.truncated.is_some());
-                let reply = submit(
-                    &mut core,
-                    vec![RecordInput {
-                        kind: Kind::Turn,
-                        tenant_id: 1,
-                        content: b"after repair".to_vec(),
-                    }],
-                    Durability::Durable,
-                );
-
-                core.step();
-                assert!(
-                    matches!(reply.recv().unwrap().unwrap(), Committed::Durable { last_lsn, .. } if last_lsn == last + 1)
-                );
-                clock.advance(1_000_000_000);
-                core.update_superblock().unwrap();
-                drop(core);
-                for _ in 0..2 {
-                    let image = Arc::new(io.crash().unwrap());
-                    let (core, report) =
-                        WriterCore::open(image, clock.clone(), "db", opts.clone()).unwrap();
-                    assert!(report.truncated.is_none());
-                    assert_eq!(&core.read(1).unwrap().unwrap().payload, b"hello");
-                    assert_eq!(&core.read(last + 1).unwrap().unwrap().payload, b"after repair");
-                }
-                let dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
-                assert_eq!(dir.segments(), &[1, 2]);
-                for id in 3..=count {
-                    assert!(!io.exists(&dir.segment_path(id)).unwrap());
-                }
-            }
+    let cases =
+        [3, 5].into_iter().flat_map(|n| [(n, false, false), (n, false, true), (n, true, true)]);
+    for (count, empty, offset_zero) in cases {
+        let case = format!("count={count}, empty={empty}, offset_zero={offset_zero}");
+        let (io, mut dir) = setup();
+        for _ in 1..count {
+            dir.prepare_next_segment(1024).unwrap();
         }
+        write(&io, 1, 0, &chain(&[(1, 1)]));
+        dir.install_superblock(1).unwrap();
+        let (mut last, mut cut) = (1, 0);
+        if !offset_zero {
+            let (prefix, _) = transaction(2, 2, (2, 0));
+            write(&io, 2, 0, &prefix);
+            (last, cut) = (2, prefix.len() as u64);
+        }
+        if !empty {
+            write(&io, 2, cut, &[1; 8]);
+        }
+        for id in 3..=count {
+            let file = io.open(&seg(id)).unwrap();
+            io.write_at(file, 0, &transaction(last + id - 2, id, (id, 0)).0).unwrap();
+            io.close(file).unwrap();
+        }
+        drop(dir);
+        let clock = clock();
+        let (mut core, report) =
+            WriterCore::open(io.clone(), clock.clone(), "db", opts(1024)).unwrap();
+        assert_eq!((report.durable_lsn, report.segments), (last, 2), "{case}");
+        assert!(report.truncated.is_some(), "{case}");
+        let committed = commit(&mut core, vec![record(Kind::Turn, 1, b"after repair")]).unwrap();
+        let Committed::Durable { last_lsn, .. } = committed;
+        assert_eq!(last_lsn, last + 1, "{case}");
+        clock.advance(1_000_000_000);
+        core.update_superblock().unwrap();
+        drop(core);
+        for _ in 0..2 {
+            let (core, report) =
+                WriterCore::open(image(&io), clock.clone(), "db", opts(1024)).unwrap();
+            assert!(report.truncated.is_none(), "{case}");
+            assert_eq!(&core.read(1).unwrap().unwrap().payload, b"hello", "{case}");
+            let repaired = core.read(last + 1).unwrap().unwrap().payload;
+            assert_eq!(repaired, b"after repair", "{case}");
+        }
+        let segments = DataDir::open(io.clone(), "db", None, 1024).unwrap().segments().to_vec();
+        assert_eq!(segments, [1, 2], "{case}");
+        assert!((3..=count).all(|id| !io.exists(&seg(id)).unwrap()), "{case}");
     }
+}
+
+fn at(images: &[(String, SimDisk)], event: &str) -> usize {
+    images.iter().position(|(e, _)| e == event).unwrap()
 }
 
 #[test]
 fn manifest_is_durable_before_tail_files_are_removed() {
-    use std::sync::atomic::Ordering;
-    for fail_manifest in [false, true] {
-        eprintln!("case: fail_manifest={fail_manifest:?}");
-        let io = Arc::new(support::ObservedIo::new(1));
+    for (case, fail_manifest) in [("trim", false), ("failed manifest sync", true)] {
+        let io = Arc::new(HookIo::sim(1));
         let mut dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
         for _ in 0..3 {
             dir.prepare_next_segment(1024).unwrap();
         }
-
-        let (first, _) = transaction(1, 1, (1, 0));
-        write(&io.disk, &dir, 1, 0, &first);
+        write(&io.inner, 1, 0, &chain(&[(1, 1)]));
         dir.install_superblock(1).unwrap();
-        write(&io.disk, &dir, 2, 0, &[1; 8]);
-        io.events.lock().unwrap().clear();
-        io.syncs.store(0, Ordering::SeqCst);
-        io.capture.store(!fail_manifest, Ordering::SeqCst);
+        write(&io.inner, 2, 0, &[1; 8]);
+        let images = io.capture();
         if fail_manifest {
-            io.fail_at.store(3, Ordering::SeqCst);
-        }
-        let result = recover(&mut dir, 1024);
-        if fail_manifest {
-            assert!(result.is_err());
-            assert_eq!(dir.segments(), &[1, 2, 3]);
-            assert!(io.exists(&dir.segment_path(3)).unwrap());
+            io.fail_nth_sync(3, data_sync);
+            assert!(recover(&mut dir, 1024).is_err(), "{case}");
+            assert_eq!(dir.segments(), &[1, 2, 3], "{case}");
+            assert!(io.exists(&seg(3)).unwrap(), "{case}");
         } else {
-            result.unwrap();
-            let events = io.events.lock().unwrap();
-            let installed = events.iter().position(|e| e == "dir-sync db").unwrap();
-            let removed =
-                events.iter().position(|e| e == "remove db/seg-0000000000000003.zdb").unwrap();
-            assert!(installed < removed);
-            for image in io.images.lock().unwrap().iter() {
-                for _ in 0..2 {
+            recover(&mut dir, 1024).unwrap();
+            let images = images.lock().unwrap();
+            let installed = at(&images, "dir-sync db");
+            assert!(installed < at(&images, "remove db/seg-0000000000000003.zdb"), "{case}");
+            // A crash after the manifest trim leaves an orphan. The next open removes it durably.
+            let image = Arc::new(images[installed].1.clone());
+            assert!(image.exists(&seg(3)).unwrap(), "{case}");
+            drop(DataDir::open(image.clone(), "db", None, 1024).unwrap());
+            assert!(!image.exists(&seg(3)).unwrap(), "{case}: orphan removed before recovery");
+            let crash = Arc::new(image.crash().unwrap());
+            assert!(!crash.exists(&seg(3)).unwrap(), "{case}: orphan cleanup is durable");
+            let (tape, report) = Tape::open(crash, clock(), "db", opts(1024)).unwrap();
+            assert_eq!(report.durable_lsn, 1, "{case}");
+            assert_eq!(&tape.read(1).unwrap().unwrap().payload, b"hello", "{case}");
+            for (event, image) in images.iter() {
+                for reopen in 0..2 {
                     let mut dir = DataDir::open(Arc::new(image.clone()), "db", None, 1024).unwrap();
-                    assert_eq!(recover(&mut dir, 1024).unwrap().report.durable_lsn, 1);
+                    let durable = recover(&mut dir, 1024).unwrap().report.durable_lsn;
+                    assert_eq!(durable, 1, "{case}: crash after {event}, reopen={reopen}");
                 }
             }
         }
         drop(dir);
-        assert!(io.handles.lock().unwrap().is_empty());
+        assert_eq!(io.open_files(), 0, "{case}");
     }
-}
-
-#[test]
-fn reopen_removes_orphans_after_manifest_trim_before_unlink() {
-    use std::sync::atomic::Ordering;
-    use zerodb_tape::sim::SimClock;
-    use zerodb_tape::{Tape, TapeOptions as Options};
-
-    let io = Arc::new(support::ObservedIo::new(1));
-    let mut dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
-    for _ in 0..3 {
-        dir.prepare_next_segment(1024).unwrap();
-    }
-    let (first, _) = transaction(1, 1, (1, 0));
-    write(&io.disk, &dir, 1, 0, &first);
-    dir.install_superblock(1).unwrap();
-    write(&io.disk, &dir, 2, 0, &[1; 8]);
-    io.events.lock().unwrap().clear();
-    io.capture.store(true, Ordering::SeqCst);
-    recover(&mut dir, 1024).unwrap();
-    let installed = io.events.lock().unwrap().iter().position(|e| e == "dir-sync db").unwrap();
-    let image = io.images.lock().unwrap()[installed].clone();
-    let orphan = dir.segment_path(3);
-    assert!(image.exists(&orphan).unwrap());
-    let image = Arc::new(image);
-    let reopened = DataDir::open(image.clone(), "db", None, 1024).unwrap();
-    assert!(!image.exists(&orphan).unwrap(), "orphan must disappear before recovery");
-    drop(reopened);
-    let crash = Arc::new(image.crash().unwrap());
-    assert!(!crash.exists(&orphan).unwrap(), "orphan cleanup must be durable");
-    let (tape, report) = Tape::open(
-        crash,
-        Arc::new(SimClock::default()),
-        "db",
-        Options { segment_size: 1024, ..Options::default() },
-    )
-    .unwrap();
-    assert_eq!(report.durable_lsn, 1);
-    assert_eq!(&tape.read(1).unwrap().unwrap().payload, b"hello");
 }
 
 #[test]
 fn every_operator_cut_crash_image_reopens_without_a_missing_durable_prefix() {
-    let io = Arc::new(support::ObservedIo::new(6));
-    let (mut core, _) =
-        WriterCore::open(io.clone(), Arc::new(SimClock::default()), "db", opts(128)).unwrap();
+    let io = Arc::new(HookIo::sim(6));
+    let (mut core, _) = open(io.clone(), opts(128));
     for _ in 0..3 {
-        let reply = submit(&mut core, vec![record(Kind::Turn, 1, [7; 8]); 1], Durability::Durable);
-        core.step();
-        reply.recv().unwrap().unwrap();
+        commit(&mut core, vec![record(Kind::Turn, 1, [7; 8])]).unwrap();
     }
-
     core.shutdown().unwrap();
     drop(core);
-    io.events.lock().unwrap().clear();
-    io.capture.store(true, Ordering::SeqCst);
+    let images = io.capture();
     Tape::recover_truncate_at_with(io.clone(), "db", 1).unwrap();
-    let events = io.events.lock().unwrap();
-    let data_synced =
-        events.iter().position(|event| event == "sync db/seg-0000000000000001.zdb").unwrap();
-    let floor_lowered =
-        events.iter().position(|event| event == "rename db/SUPERBLOCK.tmp db/SUPERBLOCK").unwrap();
-    assert!(data_synced < floor_lowered);
-    let images = io.images.lock().unwrap();
-    for (index, image) in images.iter().enumerate() {
-        let (_, report) =
-            Tape::open(Arc::new(image.clone()), Arc::new(SimClock::default()), "db", opts(128))
-                .unwrap_or_else(|error| panic!("image {index} {}: {error}", events[index]));
-        assert!(report.durable_lsn == 1 || report.durable_lsn == 3);
-        if index >= data_synced {
-            assert_eq!(report.durable_lsn, 1);
-        }
+    let images = images.lock().unwrap();
+    let data_synced = at(&images, "sync db/seg-0000000000000001.zdb");
+    assert!(data_synced < at(&images, "rename db/SUPERBLOCK.tmp db/SUPERBLOCK"));
+    for (index, (event, image)) in images.iter().enumerate() {
+        let (_, report) = Tape::open(Arc::new(image.clone()), clock(), "db", opts(128))
+            .unwrap_or_else(|error| panic!("crash after {event}: {error}"));
+        let allowed: &[u64] = if index >= data_synced { &[1] } else { &[1, 3] };
+        assert!(allowed.contains(&report.durable_lsn), "crash after {event}");
     }
+}
+
+/// A writer that committed one transaction per entry, with that many records each.
+fn written(
+    seed: u64,
+    size: u64,
+    now: u64,
+    txns: &[usize],
+) -> (Arc<SimDisk>, WriterCore<NoopStateMachine>) {
+    let disk = Arc::new(SimDisk::new(seed));
+    let clock = Arc::new(SimClock::new(now));
+    let (mut core, _) = WriterCore::open(disk.clone(), clock, "db", opts(size)).unwrap();
+    for &count in txns {
+        commit(&mut core, vec![record(Kind::Turn, 1, [7; 8]); count]).unwrap();
+    }
+    (disk, core)
 }
 
 #[test]
 fn footer_lookahead_separates_proved_corruption_from_tail_damage() {
     use Damage::*;
-    enum Expected {
-        Corruption { lsn: u64 },
-        Truncated { durable_lsn: u64, range: std::ops::RangeInclusive<u64> },
-    }
-    use Expected::*;
-    let mut cases = vec![
-        (
-            "unproved record damage".into(),
-            1024,
-            vec![1],
-            Flip(40),
-            Truncated { durable_lsn: 0, range: 1..=1 },
-        ),
-        (
-            "zeroed multi-record footer".into(),
-            1024,
-            vec![3, 1],
-            ZeroFooter(144),
-            Corruption { lsn: 3 },
-        ),
+    // Durable LSN and truncated LSNs after open, or the corrupt LSN.
+    type Opened = Result<(u64, RangeInclusive<u64>), u64>;
+    let mut cases: Vec<(String, u64, Vec<usize>, Damage, Opened)> = vec![
+        ("unproved record damage".into(), 1024, vec![1], Flip(40), Ok((0, 1..=1))),
+        ("zeroed multi-record footer".into(), 1024, vec![3, 1], ZeroFooter(144), Err(3)),
     ];
     for (size, segment, offset) in [(128, 2, 0), (1024, 1, 120)] {
         for offset in [0, 4, 40, 76] {
-            cases.push((
-                format!("proved damage: size={size}, offset={offset}"),
-                size,
-                vec![1, 1, 1],
-                Flip(offset),
-                Corruption { lsn: 1 },
-            ));
+            let case = format!("proved damage: size={size}, offset={offset}");
+            cases.push((case, size, vec![1, 1, 1], Flip(offset), Err(1)));
         }
         for fault in [GarbageFooter, MisdirectedFooter(segment, offset)] {
-            cases.push((
-                format!("replaced footer: size={size}, fault={fault:?}"),
-                size,
-                vec![1, 1],
-                fault,
-                Corruption { lsn: 2 },
-            ));
+            let case = format!("replaced footer: size={size}, fault={fault:?}");
+            cases.push((case, size, vec![1, 1], fault, Err(2)));
         }
     }
     for field in [8, 20, 48, 56, 64, 68] {
-        cases.push((
-            format!("last pending LSN: field={field}"),
-            1024,
-            vec![3, 1],
-            Flip(144 + field),
-            Corruption { lsn: 3 },
-        ));
+        let case = format!("last pending LSN: field={field}");
+        cases.push((case, 1024, vec![3, 1], Flip(144 + field), Err(3)));
     }
     for field in [0, 8, 16, 24, 28] {
-        cases.push((
-            format!("CRC-valid but invalid proof: field={field}"),
-            1024,
-            vec![1, 1],
-            InvalidProof(field),
-            Truncated { durable_lsn: 0, range: 1..=2 },
-        ));
+        let case = format!("CRC-valid but invalid proof: field={field}");
+        cases.push((case, 1024, vec![1, 1], InvalidProof(field), Ok((0, 1..=2))));
     }
-    for (case, segment_size, txns, corrupt, expected) in cases {
-        eprintln!("case: {case}");
-        let disk = Arc::new(SimDisk::new(73));
-        let (mut core, _) =
-            WriterCore::open(disk.clone(), Arc::new(SimClock::default()), "db", opts(segment_size))
-                .unwrap();
-        for count in txns {
-            let reply =
-                submit(&mut core, vec![record(Kind::Turn, 1, [7; 8]); count], Durability::Durable);
-            core.step();
-            reply.recv().unwrap().unwrap();
-        }
-        drop(core);
-        damage(&disk, segment_size, corrupt, &case);
-        let result = Tape::open(disk, Arc::new(SimClock::default()), "db", opts(segment_size));
-        match expected {
-            Corruption { lsn } => assert!(
-                matches!(&result,
-                Err(Error::CorruptionDetected { lsn: actual, .. }) if *actual == lsn),
-                "{case}: {result:?}"
-            ),
-            Truncated { durable_lsn, range } => {
-                let (_, report) = result.unwrap_or_else(|error| panic!("{case}: {error}"));
-                assert_eq!(report.durable_lsn, durable_lsn, "{case}");
-                assert_eq!(report.truncated, Some((range, segment_size)), "{case}");
+    for (case, size, txns, fault, expected) in cases {
+        let disk = written(73, size, 0, &txns).0;
+        damage(&disk, size, fault, &case);
+        let actual = match Tape::open(disk, clock(), "db", opts(size)) {
+            Ok((_, report)) => {
+                assert_eq!(report.truncated.as_ref().map(|t| t.1), Some(size), "{case}");
+                Ok((report.durable_lsn, report.truncated.unwrap().0))
             }
-        }
+            Err(Error::CorruptionDetected { lsn, .. }) => Err(lsn),
+            Err(error) => panic!("{case}: {error}"),
+        };
+        assert_eq!(actual, expected, "{case}");
     }
 }
 
 #[test]
 fn operator_cut_rejects_invalid_targets_and_corrupt_prefixes() {
-    enum Fault {
-        None,
-        CorruptPrefix,
-        EmptyFooter,
-        ZeroGap,
-    }
     enum Expected {
         Corruption(u64),
         Invalid(&'static [&'static str]),
     }
+    use Expected::*;
     let gap_size = (frame::MAX_FRAME_SIZE + frame::HEADER_LEN + 32 + 241) as u64;
-    for (case, size, txns, cut, fault, expected) in [
+    fn zero_gap(disk: &Arc<SimDisk>, size: u64) {
+        DataDir::open(disk.clone(), "db", None, size).unwrap().prepare_next_segment(size).unwrap();
+    }
+    type Case = (&'static str, u64, &'static [usize], u64, fn(&Arc<SimDisk>, u64), Expected);
+    let cases: [Case; 5] = [
+        ("interior LSN", 1024, &[1, 3], 2, |_, _| {}, Invalid(&["transaction", "1", "4"])),
         (
-            "interior LSN",
+            "corrupt prefix",
             1024,
-            vec![1, 3],
+            &[1, 1],
             2,
-            Fault::None,
-            Expected::Invalid(&["transaction", "1", "4"]),
+            |d, s| damage(d, s, Damage::Flip(40), ""),
+            Corruption(1),
         ),
-        ("corrupt prefix", 1024, vec![1, 1], 2, Fault::CorruptPrefix, Expected::Corruption(1)),
-        ("empty footer", 1024, vec![], 1, Fault::EmptyFooter, Expected::Corruption(1)),
-        ("zero gap", gap_size, vec![1, 1], 3, Fault::ZeroGap, Expected::Corruption(3)),
+        ("empty footer", 1024, &[], 1, |d, s| damage(d, s, Damage::EmptyFooter, ""), Corruption(1)),
+        ("zero gap", gap_size, &[1, 1], 3, zero_gap, Corruption(3)),
         (
             "beyond log",
             1024,
-            vec![1, 1],
+            &[1, 1],
             3,
-            Fault::None,
-            Expected::Invalid(&["cut LSN 3 exceeds last valid cut point 2"]),
+            |_, _| {},
+            Invalid(&["cut LSN 3 exceeds last valid cut point 2"]),
         ),
-    ] {
-        eprintln!("case: {case}");
-        let disk = Arc::new(SimDisk::new(74));
-        let (mut core, _) =
-            WriterCore::open(disk.clone(), Arc::new(SimClock::default()), "db", opts(size))
-                .unwrap();
-        for count in txns {
-            let reply =
-                submit(&mut core, vec![record(Kind::Turn, 1, [7; 8]); count], Durability::Durable);
-            core.step();
-            reply.recv().unwrap().unwrap();
-        }
+    ];
+    for (case, size, txns, cut, fault, expected) in cases {
+        let (disk, mut core) = written(74, size, 0, txns);
         core.shutdown().unwrap();
         drop(core);
-        match fault {
-            Fault::CorruptPrefix => damage(&disk, size, Damage::Flip(40), case),
-            Fault::EmptyFooter => empty_footer(&disk),
-            Fault::ZeroGap => {
-                let mut dir = DataDir::open(disk.clone(), "db", None, size).unwrap();
-                dir.prepare_next_segment(size).unwrap();
-            }
-            Fault::None => {}
-        }
+        fault(&disk, size);
         let error = Tape::recover_truncate_at_with(disk.clone(), "db", cut).unwrap_err();
         match expected {
-            Expected::Corruption(lsn) => assert!(
-                matches!(&error,
-                Error::CorruptionDetected { lsn: actual, .. } if *actual == lsn),
+            Corruption(lsn) => assert!(
+                matches!(&error, Error::CorruptionDetected { lsn: actual, .. } if *actual == lsn),
                 "{case}: {error:?}"
             ),
-            Expected::Invalid(messages) => {
+            Invalid(messages) => {
                 assert!(matches!(error, Error::InvalidFrame(_)), "{case}");
-                for message in messages {
-                    assert!(error.to_string().contains(message), "{case}: {error}");
-                }
+                let text = error.to_string();
+                assert!(messages.iter().all(|m| text.contains(m)), "{case}: {error}");
             }
         }
-        if matches!(fault, Fault::CorruptPrefix) {
-            assert_eq!(
-                Tape::recover_truncate_at_with(disk, "db", 0).unwrap().cut_lsn,
-                Some(0),
-                "{case}"
-            );
-        }
+        // Cutting everything needs no valid prefix.
+        let report = Tape::recover_truncate_at_with(disk, "db", 0).unwrap();
+        assert_eq!(report.cut_lsn, Some(0), "{case}");
     }
 }
 
 #[test]
 fn operator_cut_discards_oversized_tail_and_bounds_the_superblock() {
-    for floor in [0, 1, 5] {
-        eprintln!("case: floor={floor:?}");
-        for (cut, kept_bytes, commit_time) in [(0, 0, 1), (1, 120, 101), (4, 256 + 216, 102)] {
-            let case = format!("floor={floor}, cut={cut}");
-            eprintln!("case: {case}");
-            let disk = Arc::new(SimDisk::new(76));
-            let (mut core, _) =
-                WriterCore::open(disk.clone(), Arc::new(SimClock::new(100)), "db", opts(256))
-                    .unwrap();
-            for count in [1, 3, 1] {
-                let reply = submit(
-                    &mut core,
-                    vec![record(Kind::Turn, 1, [7; 8]); count],
-                    Durability::Durable,
-                );
-                core.step();
-                reply.recv().unwrap().unwrap();
-            }
-            drop(core);
-            let mut dir = DataDir::open(disk.clone(), "db", None, 256).unwrap();
-            dir.install_superblock(floor).unwrap();
-            let tail = dir.prepare_next_segment(256).unwrap();
-            let path = dir.segment_path(tail);
-            let file = disk.open(&path).unwrap();
-            disk.set_len(file, 257).unwrap();
-            disk.sync_data(file).unwrap();
-            disk.close(file).unwrap();
-            drop(dir);
-            let report = Tape::recover_truncate_at_with(disk.clone(), "db", cut).unwrap();
-            assert_eq!(report.cut_lsn, Some(cut), "{case}");
-            assert!(report.lsns_may_be_reused, "{case}");
-            assert_eq!(report.truncated.as_ref().unwrap().0, cut + 1..=5, "{case}");
-            assert_eq!(report.dropped_bytes, 1025 - kept_bytes, "{case}");
-            assert!(!disk.exists(&path).unwrap(), "{case}");
-            let dir = DataDir::open(disk.clone(), "db", None, 256).unwrap();
-            assert_eq!(dir.superblock(), floor.min(cut), "{case}");
-            drop(dir);
-            let (mut core, report) =
-                WriterCore::open(disk, Arc::new(SimClock::default()), "db", opts(256)).unwrap();
-            assert_eq!(report.durable_lsn, cut, "{case}");
-            let reply =
-                submit(&mut core, vec![record(Kind::Turn, 1, [7; 8]); 1], Durability::Durable);
-            core.step();
-            reply.recv().unwrap().unwrap();
-            assert_eq!(core.durable_lsn(), cut + 1, "{case}");
-            assert_eq!(
-                core.read(cut + 1).unwrap().unwrap().header.commit_time_ns,
-                commit_time,
-                "{case}"
-            );
-        }
+    for (floor, (cut, kept_bytes, commit_time)) in [0, 1, 5]
+        .into_iter()
+        .flat_map(|f| [(0, 0, 1), (1, 120, 101), (4, 256 + 216, 102)].map(|c| (f, c)))
+    {
+        let case = format!("floor={floor}, cut={cut}");
+        let (disk, core) = written(76, 256, 100, &[1, 3, 1]);
+        drop(core);
+        let mut dir = DataDir::open(disk.clone(), "db", None, 256).unwrap();
+        dir.install_superblock(floor).unwrap();
+        let id = dir.prepare_next_segment(256).unwrap();
+        let tail = dir.segment_path(id);
+        let file = disk.open(&tail).unwrap();
+        disk.set_len(file, 257).unwrap();
+        disk.sync_data(file).unwrap();
+        disk.close(file).unwrap();
+        drop(dir);
+        let report = Tape::recover_truncate_at_with(disk.clone(), "db", cut).unwrap();
+        assert_eq!(report.cut_lsn, Some(cut), "{case}");
+        assert!(report.lsns_may_be_reused, "{case}");
+        assert_eq!(report.truncated.as_ref().unwrap().0, cut + 1..=5, "{case}");
+        assert_eq!(report.dropped_bytes, 1025 - kept_bytes, "{case}");
+        assert!(!disk.exists(&tail).unwrap(), "{case}");
+        let superblock = DataDir::open(disk.clone(), "db", None, 256).unwrap().superblock();
+        assert_eq!(superblock, floor.min(cut), "{case}");
+        let (mut core, report) = open(disk, opts(256));
+        assert_eq!(report.durable_lsn, cut, "{case}");
+        commit(&mut core, vec![record(Kind::Turn, 1, [7; 8])]).unwrap();
+        assert_eq!(core.durable_lsn(), cut + 1, "{case}");
+        let time = core.read(cut + 1).unwrap().unwrap().header.commit_time_ns;
+        assert_eq!(time, commit_time, "{case}");
     }
 }

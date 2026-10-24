@@ -9,12 +9,12 @@ pub use crate::recovery::{recover, Recovered};
 pub use crate::segment::{SegmentWriter, DEFAULT_SEGMENT_SIZE};
 pub use crate::writer::{PreparedBatch, WriteRequest, WriterCore};
 use crate::{
-    Clock, Committed, CommittedRecord, Durability, Error, FileId, Io, Kind, LockGuard, Outcome,
-    Prepare, RecordInput, RecoveryReport, Result, SimDisk, StateMachine, Tape,
-    TapeOptions as Options, WriteResult,
+    Clock, Committed, CommittedRecord, Durability, Error, HookIo, Io, Kind, Op, Outcome, Prepare,
+    RecordInput, RecoveryReport, Result, SimDisk, StateMachine, Tape, TapeOptions as Options,
+    WriteResult,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -145,7 +145,6 @@ impl CapacityPlan {
 /// Targets data-segment I/O, after preflight metadata and application preparation.
 #[derive(Debug, Default)]
 pub struct StorageFullFault {
-    segments: Mutex<BTreeSet<FileId>>,
     write_seed: AtomicU64,
     write: AtomicBool,
     sync: AtomicBool,
@@ -153,23 +152,6 @@ pub struct StorageFullFault {
 }
 
 impl StorageFullFault {
-    /// Tracks segment handles separately from manifest and checkpoint files.
-    pub fn opened(&self, path: &Path, file: FileId) {
-        if path.file_name().unwrap().to_str().unwrap().starts_with("seg-") {
-            self.segments.lock().unwrap().insert(file);
-        }
-    }
-
-    /// Stops tracking a closed handle.
-    pub fn closed(&self, file: FileId) {
-        self.segments.lock().unwrap().remove(&file);
-    }
-
-    /// Reports whether an open handle belongs to a data segment.
-    pub fn is_segment(&self, file: FileId) -> bool {
-        self.segments.lock().unwrap().contains(&file)
-    }
-
     /// Arms a single data-write or data-sync error.
     pub fn arm(&self, plan: &CapacityPlan) {
         self.written.store(false, Ordering::SeqCst);
@@ -180,32 +162,30 @@ impl StorageFullFault {
         self.sync.store(plan.write_seed.is_none(), Ordering::SeqCst);
     }
 
-    /// Arms the disk's partial-write budget at the first prepared data write.
-    pub fn before_write(&self, disk: &SimDisk, file: FileId, first_write_len: usize) {
-        if !self.write.load(Ordering::SeqCst) && !self.sync.load(Ordering::SeqCst) {
-            return;
-        }
-        if self.is_segment(file) {
-            if self.sync.load(Ordering::SeqCst) {
-                self.written.store(true, Ordering::SeqCst);
+    /// Applies the armed error to a segment write or sync. Call it in a hook before `next`.
+    ///
+    /// A write error sets the disk's partial-write budget at the first data write.
+    /// A sync error waits until data has been written.
+    pub fn before(&self, disk: &SimDisk, op: &Op<'_>) {
+        match *op {
+            Op::Write(.., data) if op.is_segment() => {
+                if self.sync.load(Ordering::SeqCst) {
+                    self.written.store(true, Ordering::SeqCst);
+                }
+                if self.write.swap(false, Ordering::SeqCst) {
+                    assert!(data.len() >= MIN_TRANSACTION_BYTES);
+                    let seed = self.write_seed.load(Ordering::SeqCst);
+                    disk.enospc_after_bytes(Rng::new(seed).below(data.len())).unwrap();
+                }
             }
-            if self.write.swap(false, Ordering::SeqCst) {
-                assert!(first_write_len >= MIN_TRANSACTION_BYTES);
-                let partial_write_budget_limit = first_write_len;
-                let budget = Rng::new(self.write_seed.load(Ordering::SeqCst))
-                    .below(partial_write_budget_limit);
-                disk.enospc_after_bytes(budget).unwrap();
+            Op::SyncData(_)
+                if op.is_segment()
+                    && self.written.load(Ordering::SeqCst)
+                    && self.sync.swap(false, Ordering::SeqCst) =>
+            {
+                disk.storage_full_next_sync().unwrap();
             }
-        }
-    }
-
-    /// Arms the disk's typed sync error after data has been written.
-    pub fn before_sync(&self, disk: &SimDisk, file: FileId) {
-        if !self.written.load(Ordering::SeqCst) || !self.sync.load(Ordering::SeqCst) {
-            return;
-        }
-        if self.is_segment(file) && self.sync.swap(false, Ordering::SeqCst) {
-            disk.storage_full_next_sync().unwrap();
+            _ => {}
         }
     }
 }
@@ -363,12 +343,12 @@ pub fn frame_faults(seed: u64) {
             Ok(())
         }
     }
-    let io = Arc::new(CrashIo::new(SimDisk::new(seed)));
+    let io = CrashIo::new(SimDisk::new(seed));
     let replies_only = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let opts = Options { segment_size: 1024, ..Options::default() };
     let (mut core, _) = WriterCore::open_with(
         Replies(replies_only.clone()),
-        io.clone(),
+        io.hooks.clone(),
         Arc::new(SimClock::default()),
         "db",
         opts.clone(),
@@ -386,13 +366,13 @@ pub fn frame_faults(seed: u64) {
     }
     replies_only.store(false, Ordering::SeqCst);
     let replies: Vec<_> = (2..=4).map(|value| fault_request(&mut core, value, 1)).collect();
-    io.cut.store(1 + rng.below(3), Ordering::SeqCst);
+    io.faults.cut.store(1 + rng.below(3), Ordering::SeqCst);
     core.step();
     for reply in replies {
         reply.recv().unwrap().unwrap();
     }
     drop(core);
-    let image = Arc::new(io.image.lock().unwrap().take().unwrap());
+    let image = Arc::new(io.faults.image.lock().unwrap().take().unwrap());
     let (tape, report) =
         Tape::open(image, Arc::new(SimClock::default()), "db", opts.clone()).unwrap();
     assert!(
@@ -407,10 +387,11 @@ pub fn frame_faults(seed: u64) {
         Tape::open(Arc::new(io.disk.clone()), Arc::new(SimClock::default()), "db", opts).unwrap();
     assert_eq!(report.durable_lsn, 1, "later footers in the same sync group are not proof");
 
-    let io = Arc::new(CrashIo::new(SimDisk::new(seed)));
+    let io = CrashIo::new(SimDisk::new(seed));
     let opts = Options { segment_size: 128, ..Options::default() };
     let (mut core, _) =
-        WriterCore::open(io.clone(), Arc::new(SimClock::default()), "cut", opts.clone()).unwrap();
+        WriterCore::open(io.hooks.clone(), Arc::new(SimClock::default()), "cut", opts.clone())
+            .unwrap();
     for _ in 0..3 {
         let reply = fault_request(&mut core, 1, 1);
         core.step();
@@ -418,9 +399,9 @@ pub fn frame_faults(seed: u64) {
     }
     core.shutdown().unwrap();
     drop(core);
-    io.cut.store(1 + rng.below(24), Ordering::SeqCst);
-    Tape::recover_truncate_at_with(io.clone(), "cut", 1).unwrap();
-    let image = io.image.lock().unwrap().take().unwrap_or_else(|| io.disk.crash().unwrap());
+    io.faults.cut.store(1 + rng.below(24), Ordering::SeqCst);
+    Tape::recover_truncate_at_with(io.hooks.clone(), "cut", 1).unwrap();
+    let image = io.faults.image.lock().unwrap().take().unwrap_or_else(|| io.disk.crash().unwrap());
     let (_, report) =
         Tape::open(Arc::new(image), Arc::new(SimClock::default()), "cut", opts).unwrap();
     assert!(report.durable_lsn == 1 || report.durable_lsn == 3);
@@ -452,121 +433,51 @@ impl Rng {
     }
 }
 
-/// Captures one crash image at a chosen I/O boundary, without unwinding the writer.
-///
-/// Replies produced after that boundary are ignored by the oracle.
-#[derive(Debug)]
-struct CrashIo {
-    disk: SimDisk,
+/// Counters that the [`CrashIo`] hook checks on every call.
+#[derive(Debug, Default)]
+struct Faults {
     storage_full: StorageFullFault,
-    watch_segment_writes: AtomicBool,
-    segment_writes: AtomicUsize,
     cut: AtomicUsize,
     fail_sync: AtomicUsize,
     image: Mutex<Option<SimDisk>>,
 }
 
+/// Captures one crash image at a chosen I/O boundary, without unwinding the writer.
+///
+/// Replies produced after that boundary are ignored by the oracle.
+struct CrashIo {
+    hooks: Arc<HookIo>,
+    disk: SimDisk,
+    faults: Arc<Faults>,
+}
+
 impl CrashIo {
     fn new(disk: SimDisk) -> Self {
-        Self {
-            disk,
-            storage_full: StorageFullFault::default(),
-            watch_segment_writes: AtomicBool::new(false),
-            segment_writes: AtomicUsize::new(0),
-            cut: AtomicUsize::new(0),
-            fail_sync: AtomicUsize::new(0),
-            image: Mutex::new(None),
-        }
-    }
-
-    fn tick(counter: &AtomicUsize) -> bool {
-        let n = counter.load(Ordering::SeqCst);
-        n != 0 && counter.fetch_sub(1, Ordering::SeqCst) == 1
-    }
-
-    fn after<T>(&self, result: Result<T>) -> Result<T> {
-        if Self::tick(&self.cut) {
-            *self.image.lock().unwrap() = Some(self.disk.crash()?);
-        }
-        result
-    }
-
-    fn before_sync(&self) -> Result<()> {
-        if Self::tick(&self.fail_sync) {
-            self.disk.fail_next_sync()?;
-        }
-        Ok(())
+        let faults = Arc::new(Faults::default());
+        let (f, d) = (faults.clone(), disk.clone());
+        let hooks = HookIo::new(disk.clone()).with(move |op, next| {
+            if op.is_sync() && tick(&f.fail_sync) {
+                d.fail_next_sync()?;
+            }
+            f.storage_full.before(&d, &op);
+            let result = next();
+            if op.mutates() && tick(&f.cut) {
+                *f.image.lock().unwrap() = Some(d.crash()?);
+            }
+            result
+        });
+        Self { hooks: Arc::new(hooks), disk, faults }
     }
 
     fn cut_happened(&self) -> bool {
-        self.image.lock().unwrap().is_some()
+        self.faults.image.lock().unwrap().is_some()
     }
 }
 
-impl Io for CrashIo {
-    fn create(&self, path: &Path) -> Result<FileId> {
-        let file = self.after(self.disk.create(path))?;
-        self.storage_full.opened(path, file);
-        Ok(file)
-    }
-    fn open(&self, path: &Path) -> Result<FileId> {
-        let file = self.disk.open(path)?;
-        self.storage_full.opened(path, file);
-        Ok(file)
-    }
-    fn close(&self, file: FileId) -> Result<()> {
-        self.storage_full.closed(file);
-        self.disk.close(file)
-    }
-    fn write_at(&self, file: FileId, off: u64, bytes: &[u8]) -> Result<()> {
-        if self.watch_segment_writes.load(Ordering::SeqCst) && self.storage_full.is_segment(file) {
-            self.segment_writes.fetch_add(1, Ordering::SeqCst);
-        }
-        self.storage_full.before_write(&self.disk, file, bytes.len());
-        self.after(self.disk.write_at(file, off, bytes))
-    }
-    fn read_at(&self, file: FileId, off: u64, bytes: &mut [u8]) -> Result<usize> {
-        self.disk.read_at(file, off, bytes)
-    }
-    fn len(&self, file: FileId) -> Result<u64> {
-        self.disk.len(file)
-    }
-    fn set_len(&self, file: FileId, len: u64) -> Result<()> {
-        self.after(self.disk.set_len(file, len))
-    }
-    fn allocate(&self, file: FileId, len: u64) -> Result<()> {
-        self.after(self.disk.allocate(file, len))
-    }
-    fn available_bytes(&self, dir: &Path) -> Result<u64> {
-        self.disk.available_bytes(dir)
-    }
-    fn total_bytes(&self, dir: &Path) -> Result<u64> {
-        self.disk.total_bytes(dir)
-    }
-    fn sync_data(&self, file: FileId) -> Result<()> {
-        self.before_sync()?;
-        self.storage_full.before_sync(&self.disk, file);
-        self.after(self.disk.sync_data(file))
-    }
-    fn sync_dir(&self, path: &Path) -> Result<()> {
-        self.before_sync()?;
-        self.after(self.disk.sync_dir(path))
-    }
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        self.after(self.disk.rename(from, to))
-    }
-    fn remove(&self, path: &Path) -> Result<()> {
-        self.after(self.disk.remove(path))
-    }
-    fn list(&self, path: &Path) -> Result<Vec<PathBuf>> {
-        self.disk.list(path)
-    }
-    fn exists(&self, path: &Path) -> Result<bool> {
-        self.disk.exists(path)
-    }
-    fn try_lock_exclusive(&self, path: &Path) -> Result<LockGuard> {
-        self.disk.try_lock_exclusive(path)
-    }
+/// Counts down a nonzero counter. True when it reaches zero.
+fn tick(counter: &AtomicUsize) -> bool {
+    let n = counter.load(Ordering::SeqCst);
+    n != 0 && counter.fetch_sub(1, Ordering::SeqCst) == 1
 }
 
 #[derive(Clone, Debug)]
@@ -802,7 +713,7 @@ fn damage_durable(disk: &SimDisk, dir: &DataDir, rng: &mut Rng) -> (u64, u64, u8
 
 fn capacity_faults(
     mut core: WriterCore<RecordingStateMachine>,
-    io: &mut Arc<CrashIo>,
+    io: &mut CrashIo,
     clock: &Arc<SimClock>,
     opts: &Options,
     oracle: &mut Oracle,
@@ -834,11 +745,9 @@ fn capacity_faults(
         .iter()
         .map(|records| enqueue(&mut core, records.clone(), Durability::Durable, rng))
         .collect();
-    io.segment_writes.store(0, Ordering::SeqCst);
-    io.watch_segment_writes.store(true, Ordering::SeqCst);
+    let writes = io.hooks.tally(|op| u64::from(matches!(op, Op::Write(..)) && op.is_segment()));
     core.step();
-    io.watch_segment_writes.store(false, Ordering::SeqCst);
-    assert_eq!(io.segment_writes.load(Ordering::SeqCst), 0, "a floor rejection wrote to a segment");
+    assert_eq!(writes.load(Ordering::SeqCst), 0, "a floor rejection wrote to a segment");
     for (_, reply) in pending {
         let error = reply.recv().unwrap().unwrap_err();
         assert!(matches!(error.kind, Error::DiskFull));
@@ -898,8 +807,8 @@ fn capacity_faults(
             enqueue(&mut core, records, Durability::Durable, rng)
         })
         .collect();
-    io.storage_full.arm(plan);
-    io.cut.store(plan.cut, Ordering::SeqCst);
+    io.faults.storage_full.arm(plan);
+    io.faults.cut.store(plan.cut, Ordering::SeqCst);
     let full_before = io.disk.storage_full_returns().unwrap();
     core.step();
     assert!(core.is_poisoned(), "post-prepare StorageFull must poison");
@@ -917,10 +826,10 @@ fn capacity_faults(
         }
         oracle.reply(batch, if cut { None } else { Some(reply) });
     }
-    io.cut.store(0, Ordering::SeqCst);
+    io.faults.cut.store(0, Ordering::SeqCst);
     // Recover the actual post-return crash as well as any earlier captured cut.
     let crashed = io.disk.crash().unwrap();
-    let image = io.image.lock().unwrap().take();
+    let image = io.faults.image.lock().unwrap().take();
     drop(core);
     if image.is_some() {
         let (tape, _) = recording_tape(Arc::new(crashed.clone()), clock.clone(), opts.clone());
@@ -933,8 +842,8 @@ fn capacity_faults(
     oracle.verify(&tape);
     drop(tape);
     next.set_capacity(SimDisk::DEFAULT_CAPACITY).unwrap();
-    *io = Arc::new(CrashIo::new(next));
-    recording_core(io.clone(), clock.clone(), opts.clone())
+    *io = CrashIo::new(next);
+    recording_core(io.hooks.clone(), clock.clone(), opts.clone())
 }
 
 /// Runs 1 capacity fault phase and 2 or 3 crash generations, retaining acknowledged and uncertain transactions.
@@ -966,8 +875,9 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) {
     let mut disk = SimDisk::new(seed);
     let mut oracle = Oracle::default();
     for generation in 0..generations {
-        let mut io = Arc::new(CrashIo::new(disk));
-        let (mut core, mut published) = recording_core(io.clone(), clock.clone(), opts.clone());
+        let mut io = CrashIo::new(disk);
+        let (mut core, mut published) =
+            recording_core(io.hooks.clone(), clock.clone(), opts.clone());
         probe(&mut core, &mut oracle, &mut rng);
         published.verify(core.durable_lsn());
         clock.advance(1_000_000_000);
@@ -987,10 +897,10 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) {
             assert!(core.is_poisoned());
             drop(core);
             // Process restart preserves failed page-cache bytes. No crash image is taken here.
-            let (tape, _) = recording_tape(io.clone(), clock.clone(), opts.clone());
+            let (tape, _) = recording_tape(io.hooks.clone(), clock.clone(), opts.clone());
             oracle.verify(&tape);
             drop(tape);
-            (core, published) = recording_core(io.clone(), clock.clone(), opts.clone());
+            (core, published) = recording_core(io.hooks.clone(), clock.clone(), opts.clone());
             probe(&mut core, &mut oracle, &mut rng);
             published.verify(core.durable_lsn());
             if rng.below(2) == 0 {
@@ -1011,10 +921,10 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) {
                 pending.push(enqueue(&mut core, records, mode, &mut rng));
             }
             if step == cut_step {
-                io.cut.store(1 + rng.below(35), Ordering::SeqCst);
+                io.faults.cut.store(1 + rng.below(35), Ordering::SeqCst);
             }
             match rng.below(10) {
-                0 => io.fail_sync.store(1 + rng.below(6), Ordering::SeqCst),
+                0 => io.faults.fail_sync.store(1 + rng.below(6), Ordering::SeqCst),
                 1 => io.disk.enospc_after_bytes(rng.below(80 * 1024)).unwrap(),
                 _ => {}
             }
@@ -1041,7 +951,7 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) {
                 break;
             }
         }
-        disk = io.image.lock().unwrap().take().unwrap_or_else(|| io.disk.crash().unwrap());
+        disk = io.faults.image.lock().unwrap().take().unwrap_or_else(|| io.disk.crash().unwrap());
         drop(core);
         if seed.is_multiple_of(11) && generation + 1 == generations {
             let dir = DataDir::open(Arc::new(disk.clone()), "db", None, opts.segment_size).unwrap();
@@ -1055,11 +965,11 @@ fn run_seed_with_capacity(seed: u64, plan: &CapacityPlan) {
             return;
         }
         if rng.below(4) == 0 {
-            let recovery_io = Arc::new(CrashIo::new(disk.clone()));
-            recovery_io.cut.store(1 + rng.below(25), Ordering::SeqCst);
-            let (tape, _) = recording_tape(recovery_io.clone(), clock.clone(), opts.clone());
+            let recovery_io = CrashIo::new(disk.clone());
+            recovery_io.faults.cut.store(1 + rng.below(25), Ordering::SeqCst);
+            let (tape, _) = recording_tape(recovery_io.hooks.clone(), clock.clone(), opts.clone());
             drop(tape);
-            let image = recovery_io.image.lock().unwrap().take();
+            let image = recovery_io.faults.image.lock().unwrap().take();
             if let Some(image) = image {
                 disk = image;
             }
@@ -1106,47 +1016,4 @@ fn large_record(seed: u64) {
     drop(core);
     let (tape, _) = Tape::open(Arc::new(disk.crash().unwrap()), clock, "large", opts).unwrap();
     oracle.verify(&tape);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durable_damage_spans_segments_payloads_and_every_bit() {
-        let disk = Arc::new(SimDisk::new(0));
-        let clock = Arc::new(SimClock::default());
-        let opts = Options {
-            segment_size: 512,
-            superblock_interval: std::time::Duration::from_secs(1),
-            ..Options::default()
-        };
-        let (mut core, _) =
-            WriterCore::open(disk.clone(), clock.clone(), "db", opts.clone()).unwrap();
-        for _ in 0..4 {
-            probe(&mut core, &mut Oracle::default(), &mut Rng::new(1));
-        }
-        clock.advance(1_000_000_000);
-        core.update_superblock().unwrap();
-        drop(core);
-        let mut segments = 0u64;
-        let mut bits = 0u8;
-        let mut beyond_header = false;
-        for seed in 0..256 {
-            let image = Arc::new(disk.crash().unwrap());
-            let dir = DataDir::open(image.clone(), "db", None, opts.segment_size).unwrap();
-            let (segment, offset, bit) = damage_durable(&image, &dir, &mut Rng::new(seed));
-            segments |= 1 << segment;
-            bits |= 1 << bit;
-            beyond_header |= offset >= frame::HEADER_LEN as u64;
-            drop(dir);
-            assert!(matches!(
-                Tape::open(image, clock.clone(), "db", opts.clone()),
-                Err(Error::CorruptionDetected { .. })
-            ));
-        }
-        assert_eq!(segments, (1 << 1) | (1 << 2));
-        assert_eq!(bits, u8::MAX);
-        assert!(beyond_header);
-    }
 }

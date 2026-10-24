@@ -1,6 +1,4 @@
-use crate::support::{
-    append_body, open_sim, serve, sim_engine, sim_options, Dir, Via, TOKEN_A, TOKEN_B,
-};
+use crate::support::{append_body, serve, sim_engine, Dir, Via, TOKEN_A, TOKEN_B};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use zerodb::outcome::{self, Attempt, Merge};
@@ -12,15 +10,17 @@ fn seqs(window: &Value) -> Vec<u64> {
     window["turns"].as_array().unwrap().iter().map(|turn| turn["seq"].as_u64().unwrap()).collect()
 }
 
+/// What a retry must return unchanged: `seqs` and the LSNs for an append, `lsn` for a fact.
 fn receipt(body: &Value) -> Value {
-    json!([body["txn"], body["first_lsn"], body["last_lsn"], body["seqs"]])
+    json!([body["txn"], body["first_lsn"], body["last_lsn"], body["seqs"], body["lsn"]])
 }
 
 #[test]
-fn append_window_and_retry_over_both_listeners() {
+fn writes_reads_and_retries_over_both_listeners() {
     let disk = SimDisk::new(1);
     let dir = Dir::new();
-    let engine = sim_engine(&disk, None, 100);
+    let tune: fn(&mut EngineOptions) = |opts| opts.max_facts = 8;
+    let engine = sim_engine(&disk, tune);
     let running = serve(engine.clone(), &dir, MAX_CONNECTIONS);
     let repeats = || {
         let (_, stats) = running.vias[1].call(None, None, "GET", "/v1/stats", None);
@@ -114,69 +114,10 @@ fn append_window_and_retry_over_both_listeners() {
                 "{name} {row}: {rejected}"
             );
         }
-        firsts.push((name, first_body, first));
-    }
-    // The second listener's "hello" and three 100-byte turns repeat the first's. Other
-    // tests share the counter, so this is a lower bound.
-    assert!(repeats() - before >= 4, "repeats counted: {before} then {}", repeats());
+        firsts.push(("/v1/append", name, first_body, first));
 
-    // Only direct Rust API writes can store content that is not UTF-8.
-    let raw = Scope { tenant: "a".into(), agent: "a".into(), session: "raw".into() };
-    let turn = NewTurn { role: Role::Tool, content: vec![b'o', 0xff, b'k'], meta: vec![] };
-    engine.append(&raw, vec![turn], None).unwrap();
-    let (_, window) = running.vias[1].a("GET", "/v1/window?agent=a&session=raw&last=1", None);
-    let turn = &window["turns"][0];
-    assert_eq!(turn["content"], "o\u{fffd}k");
-    assert_eq!(
-        (&turn["lossy"], &turn["meta"], &turn["role"]),
-        (&json!(true), &Value::Null, &json!("tool"))
-    );
-
-    running.server.shutdown();
-    assert_eq!(Arc::strong_count(&engine), 1, "shutdown releases the engine");
-    drop(engine);
-    // Reopen on the same directory. The old socket file is stale and gets replaced.
-    let engine = sim_engine(&disk, None, 100);
-    let running = serve(engine, &dir, MAX_CONNECTIONS);
-    for (via, (name, body, first)) in running.vias.iter().zip(firsts) {
-        let (status, retry) = via.a("POST", "/v1/append", Some(&body));
-        assert_eq!(status, 200, "{name}: after reopen");
-        assert_eq!(retry["deduplicated"], true, "{name}: after reopen");
-        assert_eq!(receipt(&retry), receipt(&first), "{name}: original receipt after reopen");
-    }
-    running.server.shutdown();
-}
-
-/// A query value: `+` for a space, `/` as is, `%XX` for every other reserved byte.
-fn query_value(text: &str) -> String {
-    let byte = |byte: u8| match byte {
-        b' ' => "+".to_owned(),
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-            char::from(byte).to_string()
-        }
-        _ => format!("%{byte:02X}"),
-    };
-    text.bytes().map(byte).collect()
-}
-
-fn fact_body(key: &str, content: &str, idem_key: &str) -> Value {
-    json!({"key": key, "content": content, "idem_key": idem_key})
-}
-
-fn keys(page: &Value) -> Vec<&str> {
-    page["facts"].as_array().unwrap().iter().map(|fact| fact["key"].as_str().unwrap()).collect()
-}
-
-#[test]
-fn facts_over_http() {
-    let disk = SimDisk::new(5);
-    let dir = Dir::new();
-    let opts = EngineOptions { max_facts: 8, ..sim_options(None, 100) };
-    let running = serve(open_sim(&disk, opts.clone()), &dir, MAX_CONNECTIONS);
-    let conflict = |error: &str| (409, json!({"outcome": "not_committed", "error": error}));
-    let mut firsts = Vec::new();
-    for via in &running.vias {
-        let name = via.name();
+        // Facts over the same listener.
+        let conflict = |error: &str| (409, json!({"outcome": "not_committed", "error": error}));
         // A `/`, a space, a `+` and a multibyte character, decoded from the query string.
         let key = format!("{name}/dir/a b+\u{e9}");
         let get =
@@ -265,94 +206,103 @@ fn facts_over_http() {
                 "{name} {case}"
             );
         }
-        firsts.push((name, first_body, first));
+        firsts.push(("/v1/facts/put", name, first_body, first));
     }
+    // The second listener's "hello" and three 100-byte turns repeat the first's. Other
+    // tests share the counter, so this is a lower bound.
+    assert!(repeats() - before >= 4, "repeats counted: {before} then {}", repeats());
+
+    // Only direct Rust API writes can store content that is not UTF-8.
+    let raw = Scope { tenant: "a".into(), agent: "a".into(), session: "raw".into() };
+    let turn = NewTurn { role: Role::Tool, content: vec![b'o', 0xff, b'k'], meta: vec![] };
+    engine.append(&raw, vec![turn], None).unwrap();
+    let (_, window) = running.vias[1].a("GET", "/v1/window?agent=a&session=raw&last=1", None);
+    let turn = &window["turns"][0];
+    assert_eq!(turn["content"], "o\u{fffd}k");
+    assert_eq!(
+        (&turn["lossy"], &turn["meta"], &turn["role"]),
+        (&json!(true), &Value::Null, &json!("tool"))
+    );
+
     let full =
         json!({"outcome": "not_committed", "error": "resource_exhausted", "resource": "facts"});
     let new = fact_body("new", "v", "new");
     assert_eq!(running.vias[0].a("POST", "/v1/facts/put", Some(&new)), (429, full), "8 keys held");
-    running.server.shutdown();
 
-    let running = serve(open_sim(&disk, opts), &dir, MAX_CONNECTIONS);
-    for (via, (name, body, first)) in running.vias.iter().zip(firsts) {
-        let (status, retry) = via.a("POST", "/v1/facts/put", Some(&body));
-        assert_eq!((status, &retry["deduplicated"]), (200, &json!(true)), "{name}: after reopen");
-        assert_eq!(retry["lsn"], first["lsn"], "{name}: original receipt after reopen");
+    running.server.shutdown();
+    assert_eq!(Arc::strong_count(&engine), 1, "shutdown releases the engine");
+    drop(engine);
+    // Reopen on the same directory. The old socket file is stale and gets replaced.
+    let running = serve(sim_engine(&disk, tune), &dir, MAX_CONNECTIONS);
+    for (target, name, body, first) in firsts {
+        let via = &running.vias[usize::from(name == "unix")];
+        let (status, retry) = via.a("POST", target, Some(&body));
+        assert_eq!((status, &retry["deduplicated"]), (200, &json!(true)), "{name} {target}");
+        assert_eq!(receipt(&retry), receipt(&first), "{name} {target}: original receipt");
     }
     running.server.shutdown();
+}
+
+/// A query value: `+` for a space, `/` as is, `%XX` for every other reserved byte.
+fn query_value(text: &str) -> String {
+    let byte = |byte: u8| match byte {
+        b' ' => "+".to_owned(),
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+            char::from(byte).to_string()
+        }
+        _ => format!("%{byte:02X}"),
+    };
+    text.bytes().map(byte).collect()
+}
+
+fn fact_body(key: &str, content: &str, idem_key: &str) -> Value {
+    json!({"key": key, "content": content, "idem_key": idem_key})
+}
+
+fn keys(page: &Value) -> Vec<&str> {
+    page["facts"].as_array().unwrap().iter().map(|fact| fact["key"].as_str().unwrap()).collect()
 }
 
 #[test]
 fn auth_and_host_rules() {
     let dir = Dir::new();
-    let engine = sim_engine(&SimDisk::new(2), None, 100);
+    let engine = sim_engine(&SimDisk::new(2), |_| {});
     let running = serve(engine.clone(), &dir, MAX_CONNECTIONS);
     let [tcp, unix] = &running.vias;
     let (status, _) = unix.a("POST", "/v1/append", Some(&append_body("secret", "k", "a-data")));
     assert_eq!(status, 200);
 
     let window = "/v1/window?agent=a&session=secret&last=10";
-    let unauthorized = json!({"outcome": "not_committed", "error": "unauthorized"});
-    let forbidden = json!({"outcome": "not_committed", "error": "forbidden_host"});
-    let not_found = json!({"outcome": "not_committed", "error": "not_found"});
     let bad = "token-x-0123456789abcdefghijklmnopqrstuv";
-    // (case, via, Host, token, target, status, body or turn count)
+    let (lo, evil, wrong) = (Some("127.0.0.1"), Some("evil.example"), Some(bad));
+    let (a, b, health, stats) = (Some(TOKEN_A), Some(TOKEN_B), "/healthz", "/v1/stats");
+    // (case, via, Host, token, target, status, error or the number of A's turns read)
     let rows = [
-        ("no token", tcp, Some("127.0.0.1"), None, window, 401, Err(&unauthorized)),
-        ("bad token", tcp, Some("127.0.0.1"), Some(bad), window, 401, Err(&unauthorized)),
-        ("bad token on unix", unix, None, Some(bad), window, 401, Err(&unauthorized)),
-        ("tenant B reads A's session", tcp, Some("127.0.0.1"), Some(TOKEN_B), window, 200, Ok(0)),
-        ("tenant A", tcp, Some("127.0.0.1"), Some(TOKEN_A), window, 200, Ok(1)),
-        ("localhost with port", tcp, Some("LocalHost:7425"), Some(TOKEN_A), window, 200, Ok(1)),
-        ("ipv6 loopback", tcp, Some("[::1]:1"), Some(TOKEN_A), window, 200, Ok(1)),
-        (
-            "foreign host on tcp",
-            tcp,
-            Some("evil.example"),
-            Some(TOKEN_A),
-            window,
-            403,
-            Err(&forbidden),
-        ),
-        (
-            "loopback prefix",
-            tcp,
-            Some("127.0.0.1.evil.example"),
-            Some(TOKEN_A),
-            window,
-            403,
-            Err(&forbidden),
-        ),
-        ("missing host on tcp", tcp, None, Some(TOKEN_A), window, 403, Err(&forbidden)),
-        ("foreign host on unix", unix, Some("evil.example"), Some(TOKEN_A), window, 200, Ok(1)),
-        ("missing host on unix", unix, None, Some(TOKEN_A), window, 200, Ok(1)),
-        ("health without token", tcp, Some("127.0.0.1"), None, "/healthz", 200, Ok(0)),
-        ("stats on unix without token", unix, None, None, "/v1/stats", 200, Ok(0)),
-        ("stats on tcp", tcp, Some("127.0.0.1"), Some(TOKEN_A), "/v1/stats", 404, Err(&not_found)),
-        (
-            "stats on tcp without token",
-            tcp,
-            Some("127.0.0.1"),
-            None,
-            "/v1/stats",
-            401,
-            Err(&unauthorized),
-        ),
-        (
-            "health with foreign host",
-            tcp,
-            Some("evil.example"),
-            None,
-            "/healthz",
-            403,
-            Err(&forbidden),
-        ),
+        ("no token", tcp, lo, None, window, 401, Err("unauthorized")),
+        ("bad token", tcp, lo, wrong, window, 401, Err("unauthorized")),
+        ("bad token on unix", unix, None, wrong, window, 401, Err("unauthorized")),
+        ("tenant B reads A's session", tcp, lo, b, window, 200, Ok(0)),
+        ("tenant A", tcp, lo, a, window, 200, Ok(1)),
+        ("localhost with port", tcp, Some("LocalHost:7425"), a, window, 200, Ok(1)),
+        ("ipv6 loopback", tcp, Some("[::1]:1"), a, window, 200, Ok(1)),
+        ("foreign host on tcp", tcp, evil, a, window, 403, Err("forbidden_host")),
+        ("loopback prefix", tcp, Some("127.0.0.1.evil"), a, window, 403, Err("forbidden_host")),
+        ("missing host on tcp", tcp, None, a, window, 403, Err("forbidden_host")),
+        ("foreign host on unix", unix, evil, a, window, 200, Ok(1)),
+        ("missing host on unix", unix, None, a, window, 200, Ok(1)),
+        ("health without token", tcp, lo, None, health, 200, Ok(0)),
+        ("stats on unix without token", unix, None, None, stats, 200, Ok(0)),
+        ("stats on tcp", tcp, lo, a, stats, 404, Err("not_found")),
+        ("stats on tcp without token", tcp, lo, None, stats, 401, Err("unauthorized")),
+        ("health with foreign host", tcp, evil, None, health, 403, Err("forbidden_host")),
     ];
     for (case, via, host, token, target, status, expect) in rows {
         let (got, body) = via.call(host, token, "GET", target, None);
         assert_eq!(got, status, "{case}: {body}");
         match expect {
-            Err(expected) => assert_eq!(&body, expected, "{case}"),
+            Err(error) => {
+                assert_eq!(body, json!({"outcome": "not_committed", "error": error}), "{case}")
+            }
             Ok(count) if target == window => {
                 let turns = body["turns"].as_array().unwrap();
                 assert_eq!(turns.len(), count, "{case}");
@@ -363,13 +313,8 @@ fn auth_and_host_rules() {
     }
 
     // I11: tenant B writing the same names gets its own session, never A's.
-    let (status, appended) = tcp.call(
-        Some("127.0.0.1"),
-        Some(TOKEN_B),
-        "POST",
-        "/v1/append",
-        Some(&append_body("secret", "k", "b-data")),
-    );
+    let b_data = append_body("secret", "k", "b-data");
+    let (status, appended) = tcp.call(lo, b, "POST", "/v1/append", Some(&b_data));
     assert_eq!((status, &appended["seqs"]), (200, &json!([1])), "tenant B write");
     let (_, a) = tcp.a("GET", window, None);
     assert_eq!(a["turns"].as_array().unwrap().len(), 1, "A still sees only its turn");
@@ -379,8 +324,8 @@ fn auth_and_host_rules() {
         ("/v1/facts/get?key=secret/rule", json!({"fact": null})),
         ("/v1/facts/list?prefix=", json!({"facts": [], "next": null})),
     ] {
-        let b = tcp.call(Some("127.0.0.1"), Some(TOKEN_B), "GET", target, None);
-        assert_eq!(b, (200, nothing), "tenant B sees nothing of A's facts: {target}");
+        let got = tcp.call(lo, b, "GET", target, None);
+        assert_eq!(got, (200, nothing), "tenant B sees nothing of A's facts: {target}");
     }
     assert_eq!(tcp.a("GET", "/v1/facts/get?key=secret/rule", None).1["fact"]["content"], "a-rule");
 
@@ -428,7 +373,8 @@ fn auth_and_host_rules() {
 fn health_tracks_engine_state() {
     let disk = SimDisk::new(3);
     let dir = Dir::new();
-    let running = serve(sim_engine(&disk, Some(4096), 1), &dir, MAX_CONNECTIONS);
+    let engine = sim_engine(&disk, |o| (o.tape.free_space_floor, o.max_sessions) = (Some(4096), 1));
+    let running = serve(engine, &dir, MAX_CONNECTIONS);
     let unix = &running.vias[1];
     let instance = running.instance.as_str();
     let health = || unix.call(None, None, "GET", "/healthz", None);

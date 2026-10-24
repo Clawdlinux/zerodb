@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -21,6 +21,10 @@ use zerodb_tape::{SimDisk, SystemClock, TapeOptions};
 pub fn files(dir: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
     let entries = std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap());
     entries.map(|e| (e.file_name().into_string().unwrap(), std::fs::read(e.path()).ok())).collect()
+}
+
+pub fn chmod(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
 /// Makes a mode 0600 FIFO at `path`.
@@ -82,23 +86,14 @@ impl Drop for Dir {
     }
 }
 
-pub fn sim_engine(disk: &SimDisk, floor: Option<u64>, max_sessions: usize) -> Arc<Engine> {
-    open_sim(disk, sim_options(floor, max_sessions))
-}
-
-pub fn sim_options(floor: Option<u64>, max_sessions: usize) -> EngineOptions {
-    let tape =
-        TapeOptions { segment_size: 1 << 20, free_space_floor: floor, ..TapeOptions::default() };
-    EngineOptions {
-        tape,
-        checkpoint_interval: Duration::from_secs(3600),
-        checkpoint_bytes: u64::MAX,
-        max_sessions,
-        ..EngineOptions::default()
-    }
-}
-
-pub fn open_sim(disk: &SimDisk, opts: EngineOptions) -> Arc<Engine> {
+/// An engine on a copy of `disk` with 1 MiB segments and no timed checkpoints. `tune`
+/// edits the options first.
+pub fn sim_engine(disk: &SimDisk, tune: fn(&mut EngineOptions)) -> Arc<Engine> {
+    let tape = TapeOptions { segment_size: 1 << 20, ..TapeOptions::default() };
+    let (checkpoint_interval, checkpoint_bytes) = (Duration::from_secs(3600), u64::MAX);
+    let mut opts =
+        EngineOptions { tape, checkpoint_interval, checkpoint_bytes, ..EngineOptions::default() };
+    tune(&mut opts);
     let disk = Arc::new(disk.clone());
     Arc::new(Engine::open_with(disk, Arc::new(SystemClock), "db", opts).unwrap())
 }
@@ -257,7 +252,7 @@ impl Process {
     }
 
     /// Everything the process printed so far, stdout then stderr.
-    pub fn output(&self) -> String {
+    fn output(&self) -> String {
         self.stdout() + &self.stderr()
     }
 
@@ -389,6 +384,15 @@ pub fn init(version: &str) -> Value {
 
 pub fn text(result: &Value) -> &str {
     result["content"][0]["text"].as_str().unwrap()
+}
+
+/// Polls `done` every 10 ms for up to 30 s.
+pub fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// `zerodb init` in `dir`. Returns the token.

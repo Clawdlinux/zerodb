@@ -1,74 +1,47 @@
-use crate::support::submit;
+use crate::support::*;
 use std::sync::Arc;
-use zerodb_tape::sim::{SimClock, WriterCore};
-use zerodb_tape::{Durability, Kind, RecordInput, SimDisk, TapeOptions};
+use zerodb_tape::sim::WriterCore;
+use zerodb_tape::{Kind, SimDisk, TapeOptions};
 
 #[test]
 fn paged_offsets_cross_segments_recover_and_reload_within_budget() {
+    let small = TapeOptions { lsn_index_bytes: 1, ..TapeOptions::default() };
+    let error = WriterCore::open(Arc::new(SimDisk::new(12)), clock(), "db", small).unwrap_err();
+    assert!(error.to_string().contains("index"), "a budget below one page is rejected: {error}");
     let disk = Arc::new(SimDisk::new(11));
-    let opts =
-        TapeOptions { segment_size: 4096, lsn_index_bytes: 12 * 1024, ..TapeOptions::default() };
-    let mut expected = Vec::new();
-    let (mut core, _) =
-        WriterCore::open(disk.clone(), Arc::new(SimClock::default()), "db", opts.clone()).unwrap();
-    for group in 0..30u64 {
-        let records = (0..64u64)
-            .map(|index| {
-                let content = (group * 64 + index).to_le_bytes().to_vec();
-                expected.push(content.clone());
-                RecordInput { kind: Kind::Turn, tenant_id: 1, content }
-            })
-            .collect();
-        let reply = submit(&mut core, records, Durability::Durable);
-
-        core.step();
-        reply.recv().unwrap().unwrap();
-        assert!(core.index_stats().unwrap().resident_bytes <= opts.lsn_index_bytes);
+    let opts = TapeOptions { lsn_index_bytes: 12 * 1024, ..opts(4096) };
+    let budget = opts.lsn_index_bytes;
+    let (mut core, _) = open(disk.clone(), opts.clone());
+    let expected: Vec<_> = (0..30 * 64u64).map(|n| n.to_le_bytes().to_vec()).collect();
+    for group in expected.chunks(64) {
+        commit(&mut core, group.iter().map(|c| record(Kind::Turn, 1, c)).collect()).unwrap();
+        assert!(core.index_stats().unwrap().resident_bytes <= budget);
     }
-    let evictions = core.index_stats().unwrap().page_evictions;
-    assert!(evictions > 0);
-    assert!(core.index_stats().unwrap().dirty_page_evictions > 0);
-    let dirty = core.index_stats().unwrap().dirty_page_evictions;
+    let stats = core.index_stats().unwrap();
+    assert!(stats.page_evictions > 0 && stats.dirty_page_evictions > 0, "{stats:?}");
     disk.enospc_after_bytes(0).unwrap();
     assert_eq!(core.read(1).unwrap().unwrap().payload, expected[0], "full disk keeps reads");
-    let stats = core.index_stats().unwrap();
-    assert_eq!(stats.dirty_page_evictions, dirty, "failed write-back keeps the page dirty");
-    assert!(stats.resident_bytes <= opts.lsn_index_bytes + 4224);
+    let full = core.index_stats().unwrap();
+    let dirty = stats.dirty_page_evictions;
+    assert_eq!(full.dirty_page_evictions, dirty, "failed write-back keeps the page dirty");
+    assert!(full.resident_bytes <= budget + 4224);
     disk.enospc_after_bytes(usize::MAX).unwrap();
     assert_eq!(core.read(1920).unwrap().unwrap().payload, expected[1919]);
-    let reads_before = core.index_stats().unwrap().page_reloads;
+    let reloads = core.index_stats().unwrap().page_reloads;
     for lsn in [1, 1920, 256, 1025, 512, 1919, 1] {
-        eprintln!("case: lsn={lsn:?}");
         assert_eq!(core.read(lsn).unwrap().unwrap().payload, expected[lsn as usize - 1]);
-        assert!(core.index_stats().unwrap().resident_bytes <= opts.lsn_index_bytes);
+        assert!(core.index_stats().unwrap().resident_bytes <= budget, "lsn={lsn}");
     }
-    assert!(core.index_stats().unwrap().page_reloads > reads_before);
-    assert!(core.read(0).unwrap().is_none());
-    assert!(core.read(1921).unwrap().is_none());
+    assert!(core.index_stats().unwrap().page_reloads > reloads);
+    assert!(core.read(0).unwrap().is_none() && core.read(1921).unwrap().is_none());
     core.shutdown().unwrap();
     drop(core);
-    let (core, report) = WriterCore::open(
-        Arc::new(disk.crash().unwrap()),
-        Arc::new(SimClock::default()),
-        "db",
-        opts.clone(),
-    )
-    .unwrap();
+    let (core, report) = open(image(&disk), opts);
     assert_eq!(report.durable_lsn, 1920);
     assert!(report.segments > 1);
     for (index, content) in expected.iter().enumerate().rev() {
-        assert_eq!(core.read(index as u64 + 1).unwrap().unwrap().payload, *content);
-        assert!(core.index_stats().unwrap().resident_bytes <= opts.lsn_index_bytes);
+        let lsn = index as u64 + 1;
+        assert_eq!(core.read(lsn).unwrap().unwrap().payload, *content, "lsn={lsn}");
+        assert!(core.index_stats().unwrap().resident_bytes <= budget, "lsn={lsn}");
     }
-}
-
-#[test]
-fn an_index_budget_smaller_than_one_page_is_rejected() {
-    let result = WriterCore::open(
-        Arc::new(SimDisk::new(12)),
-        Arc::new(SimClock::default()),
-        "db",
-        TapeOptions { lsn_index_bytes: 1, ..TapeOptions::default() },
-    );
-    assert!(result.unwrap_err().to_string().contains("index"));
 }

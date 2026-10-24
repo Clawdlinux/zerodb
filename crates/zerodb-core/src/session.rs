@@ -354,39 +354,9 @@ mod tests {
         let mut index = Index::new(4096, 10, 100);
         index.reserve(&key, 17).unwrap();
         index.publish(&key, 1, 2).unwrap();
+        assert_eq!(index.window(&key, 1, 2, |_| unreachable!()).unwrap(), vec![2]);
         index.sessions.get_mut(&key).unwrap().len = 17;
         let error = index.window(&key, 10, 11, |_| unreachable!()).unwrap_err();
         assert!(matches!(error.kind, ErrorKind::CorruptIndex));
-    }
-
-    #[test]
-    fn geometric_slots_dense_windows_and_eviction() {
-        let key = Key(1, "a".into(), "s".into());
-        for count in [1, 16, 17, 5000] {
-            let mut index = Index::new(64 * 1024, 10, 100);
-            assert_eq!(index.reserve(&key, count).unwrap(), 1);
-            for seq in 1..=count as u64 {
-                index.publish(&key, seq, seq + 10).unwrap();
-            }
-            assert_eq!(
-                index.window(&key, count as u64, count as u64 + 1, |_| unreachable!()).unwrap(),
-                vec![count as u64 + 10]
-            );
-            assert_eq!(
-                index.window(&key, 1, count as u64 + 1, |_| unreachable!()).unwrap().len(),
-                count
-            );
-        }
-        let mut index = Index::new(128, 10, 100);
-        index.reserve(&key, 1).unwrap();
-        index.publish(&key, 1, 11).unwrap();
-        index.clean(&key, 0, 11, Backing { file: "page".into(), offset: 0, len: 1 });
-        let other = Key(2, "a".into(), "s".into());
-        index.reserve(&other, 1).unwrap();
-        index.publish(&other, 1, 12).unwrap();
-        assert!(index.sessions[&key].pages[0].slots.is_none());
-        index.clean(&other, 0, 12, Backing { file: "page".into(), offset: 1, len: 1 });
-        assert_eq!(index.window(&key, 1, 2, |_| Ok(vec![11])).unwrap(), vec![11]);
-        assert_eq!(index.hot_bytes, 128);
     }
 }

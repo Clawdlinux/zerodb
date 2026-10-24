@@ -1,10 +1,11 @@
-use crate::support::{self, append_body, Dir, Process, Via};
+use crate::support::{self, append_body, chmod, wait_for, Dir, Process, Via};
 use serde_json::{json, Value};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 struct Ctx {
+    case: &'static str,
     dir: Dir,
     config: PathBuf,
     token: String,
@@ -26,6 +27,17 @@ impl Ctx {
         Process::spawn(&self.dir.0, args)
     }
 
+    /// Runs `zerodb` to its exit. Checks the exit code and that each of `lines` is a whole
+    /// line of its output. Returns the output.
+    fn cli(&self, args: &[&str], code: i32, lines: &[&str]) -> String {
+        let (status, out) = self.run(args).wait();
+        assert_eq!(status.code(), Some(code), "{}: {args:?}: {out}", self.case);
+        for line in lines {
+            assert!(out.lines().any(|got| got == *line), "{}: {line} in {out}", self.case);
+        }
+        out
+    }
+
     fn serve(&self, data: &Path, extra: &[&str]) -> Process {
         let (config, data) = (self.config.to_str().unwrap(), data.to_str().unwrap());
         let args = ["serve", "--config", config, "--data-dir", data];
@@ -39,24 +51,17 @@ impl Ctx {
         via.call(Some("127.0.0.1"), Some(&self.token), "POST", "/v1/append", Some(&body))
     }
 
-    fn write_config(&self, body: &str, mode: u32) {
+    /// Replaces the config with a mode 0600 one holding these tenants.
+    fn tenants(&self, tenants: &str) -> Vec<String> {
         std::fs::remove_file(&self.config).unwrap();
-        std::fs::write(&self.config, body).unwrap();
-        std::fs::set_permissions(&self.config, std::fs::Permissions::from_mode(mode)).unwrap();
+        std::fs::write(&self.config, format!(r#"{{"tenants": {tenants}}}"#)).unwrap();
+        chmod(&self.config, 0o600);
+        vec![]
     }
 
     fn private_data_dir(&self, mode: u32) {
         std::fs::create_dir(&self.data).unwrap();
-        std::fs::set_permissions(&self.data, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    /// Starts a server on this data directory, kills it, and leaves its socket behind.
-    fn stale_socket(&mut self) {
-        let mut first = self.serve(&self.data, &[]);
-        first.ready();
-        first.child.kill().unwrap();
-        first.wait();
-        assert!(self.socket.exists(), "a killed server leaves its socket");
+        chmod(&self.data, mode);
     }
 
     /// Keeps a server on `data` with this row's socket path running.
@@ -65,6 +70,10 @@ impl Ctx {
         let (instance, _) = other.ready();
         self.other = Some((other, instance));
     }
+}
+
+fn args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| arg.to_string()).collect()
 }
 
 enum Expect {
@@ -89,16 +98,16 @@ const TENANT_B: &str = r#"{"name": "b", "token": "secret-token-0123456789abcdefg
 /// a config made by `zerodb init`, and a data directory the server creates.
 #[test]
 fn startup_checks() {
+    use Expect::{Fails, Serves};
     type Prepare = fn(&mut Ctx) -> Vec<String>;
     let rows: &[(&str, Prepare, Expect)] = &[
         (
             "config mode 0644",
             |c| {
-                std::fs::set_permissions(&c.config, std::fs::Permissions::from_mode(0o644))
-                    .unwrap();
+                chmod(&c.config, 0o644);
                 vec![]
             },
-            Expect::Fails(1, "found mode 0644"),
+            Fails(1, "found mode 0644"),
         ),
         (
             "config is a FIFO",
@@ -107,117 +116,87 @@ fn startup_checks() {
                 support::mkfifo(&c.config);
                 vec![]
             },
-            Expect::Fails(1, "must be a regular file"),
+            Fails(1, "must be a regular file"),
         ),
         (
             "duplicate tenant name",
-            |c| {
-                c.write_config(
-                    &format!(
-                        r#"{{"tenants": [{TENANT}, {}]}}"#,
-                        TENANT_B.replace("\"b\"", "\"a\"")
-                    ),
-                    0o600,
-                );
-                vec![]
-            },
-            Expect::Fails(1, "tenants[1]: two tenants share a name"),
+            |c| c.tenants(&format!("[{TENANT}, {}]", TENANT_B.replace("\"b\"", "\"a\""))),
+            Fails(1, "tenants[1]: two tenants share a name"),
         ),
         (
             "duplicate token",
-            |c| {
-                c.write_config(
-                    &format!(r#"{{"tenants": [{TENANT}, {}]}}"#, TENANT.replace("\"a\"", "\"b\"")),
-                    0o600,
-                );
-                vec![]
-            },
-            Expect::Fails(1, "tenants[1]: two tenants share a token"),
+            |c| c.tenants(&format!("[{TENANT}, {}]", TENANT.replace("\"a\"", "\"b\""))),
+            Fails(1, "tenants[1]: two tenants share a token"),
         ),
         (
             "short token",
-            |c| {
-                c.write_config(r#"{"tenants": [{"name": "a", "token": "secret-token"}]}"#, 0o600);
-                vec![]
-            },
-            Expect::Fails(1, "32 to 1024 bytes"),
+            |c| c.tenants(r#"[{"name": "a", "token": "secret-token"}]"#),
+            Fails(1, "32 to 1024 bytes"),
         ),
         (
             "tenants as a map",
-            |c| {
-                c.write_config(
-                    r#"{"tenants": {"a": "secret-token-0123456789abcdefghijkl"}}"#,
-                    0o600,
-                );
-                vec![]
-            },
-            Expect::Fails(1, "must be an array"),
+            |c| c.tenants(r#"{"a": "secret-token-0123456789abcdefghijkl"}"#),
+            Fails(1, "must be an array"),
         ),
         (
             "extra tenant field",
-            |c| {
-                c.write_config(
-                    &format!(r#"{{"tenants": [{}]}}"#, TENANT.replace('}', r#", "x": 1}"#)),
-                    0o600,
-                );
-                vec![]
-            },
-            Expect::Fails(1, "exactly a string"),
+            |c| c.tenants(&format!("[{}]", TENANT.replace('}', r#", "x": 1}"#))),
+            Fails(1, "exactly a string"),
         ),
         (
             "mcp token file mode 0644",
             |c| {
                 let path = c.dir.0.join("t");
                 std::fs::write(&path, &c.token).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                chmod(&path, 0o644);
                 let url = format!("unix://{}", c.socket.display());
-                ["mcp", "--token-file", path.to_str().unwrap(), "--url", &url]
-                    .map(Into::into)
-                    .into()
+                args(&["mcp", "--token-file", path.to_str().unwrap(), "--url", &url])
             },
-            Expect::Fails(1, "found mode 0644"),
+            Fails(1, "found mode 0644"),
         ),
         (
             "mcp url over non-loopback http",
-            |_| ["mcp", "--url", "http://example.com:80"].map(Into::into).into(),
-            Expect::Fails(1, "http sends the token in cleartext"),
+            |_| args(&["mcp", "--url", "http://example.com:80"]),
+            Fails(1, "http sends the token in cleartext"),
         ),
         (
             "mcp url without a port",
-            |_| ["mcp", "--url", "http://127.0.0.1"].map(Into::into).into(),
-            Expect::Fails(1, "needs an explicit :<port>"),
+            |_| args(&["mcp", "--url", "http://127.0.0.1"]),
+            Fails(1, "needs an explicit :<port>"),
         ),
         (
             "non-loopback tcp",
-            |_| vec!["--listen".into(), "0.0.0.0:0".into()],
-            Expect::Fails(1, zerodb::listen::NEEDS_TLS),
+            |_| args(&["--listen", "0.0.0.0:0"]),
+            Fails(1, zerodb::listen::NEEDS_TLS),
         ),
-        ("socket mode 0600", |_| vec![], Expect::Serves),
-        ("no tcp", |_| vec!["--listen".into(), "none".into()], Expect::Serves),
+        ("socket mode 0600", |_| vec![], Serves),
+        ("no tcp", |_| args(&["--listen", "none"]), Serves),
         (
             "two tenants",
-            |c| {
-                let tenant = format!(r#"{{"name": "a", "token": "{}"}}"#, c.token);
-                c.write_config(&format!(r#"{{"tenants": [{tenant}, {TENANT_B}]}}"#), 0o600);
-                vec![]
-            },
-            Expect::Serves,
+            |c| c.tenants(&format!(r#"[{{"name": "a", "token": "{}"}}, {TENANT_B}]"#, c.token)),
+            Serves,
         ),
         (
             "socket group 0660",
             |c| {
-                let gid = std::fs::metadata(&c.dir.0).unwrap().gid();
-                vec!["--unix-socket-group".into(), gid.to_string()]
+                args(&[
+                    "--unix-socket-group",
+                    &std::fs::metadata(&c.dir.0).unwrap().gid().to_string(),
+                ])
             },
-            Expect::Serves,
+            Serves,
         ),
         (
             "stale socket from a killed server",
             |c| {
-                c.stale_socket();
+                let mut first = c.serve(&c.data, &[]);
+                first.ready();
+                first.child.kill().unwrap();
+                first.wait();
+                assert!(c.socket.exists(), "a killed server leaves its socket");
                 vec![]
             },
-            Expect::Serves,
+            Serves,
         ),
         (
             "live socket of another server",
@@ -226,7 +205,7 @@ fn startup_checks() {
                 c.other(&c.dir.0.join("other"));
                 vec![]
             },
-            Expect::Fails(1, "another server is listening"),
+            Fails(1, "another server is listening"),
         ),
         (
             "regular file at the socket path",
@@ -235,18 +214,18 @@ fn startup_checks() {
                 std::fs::write(&c.socket, "").unwrap();
                 vec![]
             },
-            Expect::Fails(1, "is not a socket"),
+            Fails(1, "is not a socket"),
         ),
         (
             "group-writable socket directory",
             |c| {
                 let parent = c.dir.0.join("g");
                 std::fs::create_dir(&parent).unwrap();
-                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+                chmod(&parent, 0o770);
                 c.socket = parent.join("s");
-                vec!["--unix-socket".into(), c.socket.to_str().unwrap().into()]
+                args(&["--unix-socket", c.socket.to_str().unwrap()])
             },
-            Expect::Fails(1, "not writable by group or others"),
+            Fails(1, "not writable by group or others"),
         ),
         (
             "existing data dir with mode 0755",
@@ -254,7 +233,7 @@ fn startup_checks() {
                 c.private_data_dir(0o755);
                 vec![]
             },
-            Expect::Fails(1, "mode 0700 or stricter, found mode 0755"),
+            Fails(1, "mode 0700 or stricter, found mode 0755"),
         ),
         (
             "two data dirs race for one socket path with a stale socket on it",
@@ -264,14 +243,14 @@ fn startup_checks() {
                 let socket = c.socket.to_str().unwrap().to_owned();
                 let other = c.serve(&c.dir.0.join("other"), &["--unix-socket", &socket]);
                 c.other = Some((other, String::new()));
-                vec!["--unix-socket".into(), socket]
+                args(&["--unix-socket", &socket])
             },
             Expect::OneWins,
         ),
         (
             "path past sun_path",
-            |c| vec!["--unix-socket".into(), c.path(&"x".repeat(zerodb::listen::SUN_PATH_BYTES))],
-            Expect::Fails(1, "sun_path limit; set --unix-socket to a shorter path"),
+            |c| args(&["--unix-socket", &c.path(&"x".repeat(zerodb::listen::SUN_PATH_BYTES))]),
+            Fails(1, "sun_path limit; set --unix-socket to a shorter path"),
         ),
         (
             "staging path past sun_path",
@@ -281,9 +260,9 @@ fn startup_checks() {
                 std::fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
                 c.socket = parent.join("x");
                 assert!(c.socket.as_os_str().len() < 100 && parent.as_os_str().len() == 95);
-                vec!["--unix-socket".into(), c.socket.to_str().unwrap().into()]
+                args(&["--unix-socket", c.socket.to_str().unwrap()])
             },
-            Expect::Fails(1, "sun_path limit; set --unix-socket to a shorter path"),
+            Fails(1, "sun_path limit; set --unix-socket to a shorter path"),
         ),
         (
             "second serve on a locked data dir",
@@ -291,7 +270,7 @@ fn startup_checks() {
                 c.other(&c.data.clone());
                 vec![]
             },
-            Expect::Fails(75, "is locked by pid="),
+            Fails(75, "is locked by pid="),
         ),
         (
             "LOCK is a FIFO and the TCP port is taken",
@@ -301,9 +280,9 @@ fn startup_checks() {
                 let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let listen = taken.local_addr().unwrap().to_string();
                 c.held.push(taken.into());
-                vec!["--listen".into(), listen]
+                args(&["--listen", &listen])
             },
-            Expect::Fails(1, "cannot listen on"),
+            Fails(1, "cannot listen on"),
         ),
         // macOS refuses a connect to a full backlog with ECONNREFUSED, as for a stale
         // socket, so only Linux can tell a saturated listener is live.
@@ -315,7 +294,7 @@ fn startup_checks() {
                 c.held = support::saturated(&c.socket);
                 vec![]
             },
-            Expect::Fails(1, "another server is listening"),
+            Fails(1, "another server is listening"),
         ),
         (
             "second serve on the same fixed port and data dir",
@@ -326,19 +305,19 @@ fn startup_checks() {
                 let mut first = c.serve(&c.data, &["--listen", &listen]);
                 let (instance, _) = first.ready();
                 c.other = Some((first, instance));
-                vec!["--listen".into(), listen]
+                args(&["--listen", &listen])
             },
-            Expect::Fails(75, "is locked by pid="),
+            Fails(75, "is locked by pid="),
         ),
         #[cfg(feature = "fault-inject")]
-        ("exit on poison", |_| vec!["--exit-on-poison".into()], Expect::ExitsOnPoison(false)),
+        ("exit on poison", |_| args(&["--exit-on-poison"]), Expect::ExitsOnPoison(false)),
         #[cfg(feature = "fault-inject")]
         (
             "exit on poison keeps a socket another server installed later",
-            |_| vec!["--exit-on-poison".into()],
+            |_| args(&["--exit-on-poison"]),
             Expect::ExitsOnPoison(true),
         ),
-        ("recover", |_| vec!["--log-requests".into()], Expect::Recovers),
+        ("recover", |_| args(&["--log-requests"]), Expect::Recovers),
     ];
 
     for (case, prepare, expect) in rows {
@@ -355,7 +334,7 @@ fn startup_checks() {
         let data = dir.0.join("d");
         let socket = data.join(zerodb::listen::SOCKET_NAME);
         let token = token.trim().to_owned();
-        let mut ctx = Ctx { dir, config, token, data, socket, other: None, held: vec![] };
+        let mut ctx = Ctx { case, dir, config, token, data, socket, other: None, held: vec![] };
         let extra = prepare(&mut ctx);
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         let mut server = match extra.first() {
@@ -363,6 +342,14 @@ fn startup_checks() {
             _ => ctx.serve(&ctx.data, &extra),
         };
         let unix = Via::Unix(ctx.socket.clone());
+        let healthy = |instance: &str, why: &str| {
+            let health = json!({"status": "ok", "instance": instance});
+            assert_eq!(
+                unix.call(None, None, "GET", "/healthz", None),
+                (200, health),
+                "{case}: {why}"
+            );
+        };
         match *expect {
             Expect::Fails(code, fragment) => {
                 let (status, stderr) = server.wait();
@@ -382,22 +369,17 @@ fn startup_checks() {
             Expect::OneWins => {
                 let (other, _) = ctx.other.take().unwrap();
                 let mut pair = [server, other];
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                let lost = loop {
-                    if let Some(lost) =
-                        (0..2).find(|&i| pair[i].child.try_wait().unwrap().is_some())
-                    {
-                        break lost;
-                    }
-                    assert!(std::time::Instant::now() < deadline, "{case}: neither failed");
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                };
+                let mut lost = None;
+                wait_for(case, || {
+                    lost = (0..2).find(|&i| pair[i].child.try_wait().unwrap().is_some());
+                    lost.is_some()
+                });
+                let lost = lost.unwrap_or_default();
                 let (status, stderr) = pair[lost].wait();
                 assert_eq!(status.code(), Some(1), "{case}: {stderr}");
                 assert!(stderr.contains("another server is listening on"), "{case}: {stderr}");
                 let (instance, _) = pair[1 - lost].ready();
-                let health = json!({"status": "ok", "instance": instance});
-                assert_eq!(unix.call(None, None, "GET", "/healthz", None), (200, health), "{case}");
+                healthy(&instance, "the winner serves");
             }
             Expect::Serves => {
                 let (instance, tcp) = server.ready();
@@ -415,76 +397,56 @@ fn startup_checks() {
                 let address =
                     format!("instance={instance} unix={} tcp={tcp_text}", ctx.socket.display());
                 assert!(lock.contains(&address), "{case}: LOCK {lock:?}");
-                let health = json!({"status": "ok", "instance": instance});
-                assert_eq!(unix.call(None, None, "GET", "/healthz", None), (200, health), "{case}");
+                healthy(&instance, "serves");
                 let via = tcp.map_or(unix.clone(), Via::Tcp);
                 assert_eq!(ctx.append(&via, "k").0, 200, "{case}: the init token works");
-                let left: Vec<String> = std::fs::read_dir(&ctx.data)
-                    .unwrap()
-                    .flatten()
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .filter(|name| name.starts_with(".zs."))
-                    .collect();
-                assert!(left.is_empty(), "{case}: staging directories {left:?}");
+                let entries = std::fs::read_dir(&ctx.data).unwrap().flatten();
+                let staged =
+                    entries.filter(|e| e.file_name().to_string_lossy().starts_with(".zs."));
+                assert_eq!(staged.count(), 0, "{case}: staging directories left");
             }
             Expect::Recovers => {
                 server.ready();
-                let (status, first) = ctx.append(&unix, "one");
-                assert_eq!(status, 200, "{case}: {first}");
-                let (status, second) = ctx.append(&unix, "two");
-                assert_eq!(status, 200, "{case}: {second}");
-                let cut = first["last_lsn"].to_string();
-                let data = ctx.data.to_str().unwrap();
+                let [first, second] = ["one", "two"].map(|key| {
+                    let (status, reply) = ctx.append(&unix, key);
+                    assert_eq!(status, 200, "{case}: {reply}");
+                    reply
+                });
+                let (cut, data) = (first["last_lsn"].to_string(), ctx.data.to_str().unwrap());
                 let url = format!("unix://{}", ctx.socket.display());
                 let token = support::private_file(&ctx.dir, "token", &ctx.token);
                 let load = ["load", "--url", &url, "--token-file", &token];
-                let good = ["--writers", "2", "--turns", "4", "--think", "1"];
-                let (status, out) = ctx.run(&[&load[..], &good].concat()).wait();
-                assert!(status.success(), "{case}: {out}");
-                for line in ["turns=4", "think_ms=1"] {
-                    assert!(out.lines().any(|got| got == line), "{case}: {line} in {out}");
-                }
+                let good = [&load[..], &["--writers", "2", "--turns", "4", "--think", "1"]];
+                let out = ctx.cli(&good.concat(), 0, &["turns=4", "think_ms=1"]);
                 assert!(out.lines().any(|line| line.starts_with("p99_us=")), "{case}: {out}");
                 let huge = ["--writers", "9223372036854775808", "--batch", "2", "--turns", "4"];
                 let slow = ["--turns", "4", "--think", "4001"];
-                for bad in [&["--writers", "2", "--turns", "3"][..], &huge, &slow] {
-                    let (status, out) = ctx.run(&[&load[..], bad].concat()).wait();
-                    assert_eq!(status.code(), Some(2), "{case}: {bad:?} is a usage error: {out}");
+                for usage in [&["--writers", "2", "--turns", "3"][..], &huge, &slow] {
+                    ctx.cli(&[&load[..], usage].concat(), 2, &[]);
                 }
-                let (status, stats) = ctx.run(&["stats", "--data-dir", data]).wait();
-                assert!(status.success(), "{case}: {stats}");
                 let last = second["last_lsn"].as_u64().unwrap() + 4;
-                let durable = format!("durable_lsn={last}");
-                for line in ["health=ok", &durable] {
-                    assert!(stats.lines().any(|got| got == line), "{case}: {line} in {stats}");
-                }
+                let healthy = ["health=ok".to_owned(), format!("durable_lsn={last}")];
+                let healthy = healthy.each_ref().map(String::as_str);
+                ctx.cli(&["stats", "--data-dir", data], 0, &healthy);
+                // Both refuse while the server holds the lock.
                 let recover = ["recover", "--truncate-at", &cut, "--data-dir", data];
-                let (status, stderr) = ctx.run(&recover).wait();
-                assert_eq!(status.code(), Some(75), "{case}: refused under the lock: {stderr}");
                 let verify = ["verify", "--data-dir", data];
-                let (status, stderr) = ctx.run(&verify).wait();
-                assert_eq!(status.code(), Some(75), "{case}: verify under the lock: {stderr}");
+                ctx.cli(&recover, 75, &[]);
+                ctx.cli(&verify, 75, &[]);
                 server.child.kill().unwrap();
                 let (_, stderr) = server.wait();
                 let line = " POST /v1/append 200 tenant=a ";
                 assert!(stderr.contains(line), "{case}: --log-requests logs requests: {stderr}");
-                // A read-only backup must still verify.
+                // A read-only backup must still verify, without writing to it.
                 let modes = |mode| {
-                    for name in support::files(&ctx.data).into_keys() {
-                        let perms = std::fs::Permissions::from_mode(mode);
-                        std::fs::set_permissions(ctx.data.join(name), perms).unwrap();
-                    }
+                    support::files(&ctx.data)
+                        .into_keys()
+                        .for_each(|f| chmod(&ctx.data.join(f), mode))
                 };
                 modes(0o400);
                 let before = support::files(&ctx.data);
-                let inside = ["--scratch", data];
-                let (status, out) = ctx.run(&[&verify[..], &inside].concat()).wait();
-                assert_eq!(status.code(), Some(2), "{case}: scratch inside the data dir: {out}");
-                let (status, out) = ctx.run(&verify).wait();
-                assert!(status.success(), "{case}: {out}");
-                for line in ["health=ok", &durable] {
-                    assert!(out.lines().any(|got| got == line), "{case}: {line} in {out}");
-                }
+                ctx.cli(&[&verify[..], &["--scratch", data]].concat(), 2, &[]);
+                ctx.cli(&verify, 0, &healthy);
                 assert_eq!(support::files(&ctx.data), before, "{case}: verify wrote the data dir");
                 let left =
                     support::files(&ctx.dir.0).into_keys().filter(|n| n.contains(".verify-"));
@@ -492,21 +454,18 @@ fn startup_checks() {
                 modes(0o600);
                 let from = first["first_lsn"].as_u64().unwrap();
                 let dump = ["dump", "--data-dir", data, "--from", &from.to_string()];
-                let (status, out) = ctx.run(&dump).wait();
-                assert!(status.success() && !out.contains("two"), "{case}: no content: {out}");
+                let out = ctx.cli(&dump, 0, &[]);
                 let lsns: Vec<&str> = out.lines().map(|l| l.split(' ').next().unwrap()).collect();
                 let acked: Vec<String> = (from..=last).map(|l| format!("lsn={l}")).collect();
                 assert_eq!(lsns, acked, "{case}: acked records in LSN order: {out}");
-                let (status, out) = ctx.run(&[&dump[..], &["--limit", "1"]].concat()).wait();
-                assert!(status.success() && out.lines().count() == 1, "{case}: limit 1: {out}");
-                let (status, stats) = ctx.run(&["stats", "--data-dir", data]).wait();
-                assert_eq!(status.code(), Some(1), "{case}: no server: {stats}");
+                assert!(!out.contains("two"), "{case}: dump shows no content: {out}");
+                let out = ctx.cli(&[&dump[..], &["--limit", "1"]].concat(), 0, &[]);
+                assert_eq!(out.lines().count(), 1, "{case}: limit 1: {out}");
+                ctx.cli(&["stats", "--data-dir", data], 1, &[]);
                 for url in ["http://127.0.0.1:7425", "not-a-url"] {
-                    let (status, stats) = ctx.run(&["stats", "--url", url]).wait();
-                    assert_eq!(status.code(), Some(2), "{case}: {url} is a usage error: {stats}");
+                    ctx.cli(&["stats", "--url", url], 2, &[]);
                 }
-                let (status, report) = ctx.run(&recover).wait();
-                assert!(status.success(), "{case}: {report}");
+                ctx.cli(&recover, 0, &[]);
                 let mut restarted = ctx.serve(&ctx.data, &[]);
                 restarted.ready();
                 let target = "/v1/window?agent=a&session=s&last=10";
@@ -516,18 +475,14 @@ fn startup_checks() {
                 assert_eq!(contents, [&json!("one")], "{case}: only turns at or below the cut");
                 restarted.child.kill().unwrap();
                 restarted.wait();
-                // Replay hides a bad checkpoint from the open, so verify reports it.
+                // Replay hides a bad checkpoint from the open, so verify reports it. A symlink
+                // is refused, never skipped into an incomplete copy.
                 let checkpoint = ctx.data.join("CHECKPOINT");
                 std::fs::write(&checkpoint, "garbage").unwrap();
-                let (status, out) = ctx.run(&verify).wait();
-                assert_eq!(status.code(), Some(1), "{case}: rejected checkpoint: {out}");
-                assert!(out.contains("checkpoint"), "{case}: {out}");
+                assert!(ctx.cli(&verify, 1, &[]).contains("checkpoint"), "{case}");
                 std::fs::remove_file(&checkpoint).unwrap();
-                // A symlink is refused, never skipped into an incomplete copy.
                 std::os::unix::fs::symlink("elsewhere", &checkpoint).unwrap();
-                let (status, out) = ctx.run(&verify).wait();
-                assert_eq!(status.code(), Some(1), "{case}: symlinked checkpoint: {out}");
-                assert!(out.contains("not a regular file"), "{case}: {out}");
+                assert!(ctx.cli(&verify, 1, &[]).contains("not a regular file"), "{case}");
                 std::fs::remove_file(checkpoint).unwrap();
                 // The restart put the superblock above LSN 1, so this is corruption, not a torn tail.
                 let segment = ctx.data.join("seg-0000000000000001.zdb");
@@ -535,9 +490,7 @@ fn startup_checks() {
                 let (file, mut byte) = (file.unwrap(), [0]);
                 file.read_exact_at(&mut byte, 40).unwrap();
                 file.write_all_at(&[!byte[0]], 40).unwrap();
-                let (status, out) = ctx.run(&verify).wait();
-                assert_eq!(status.code(), Some(1), "{case}: corrupt first frame: {out}");
-                assert!(out.contains("at LSN 1,"), "{case}: names the LSN: {out}");
+                assert!(ctx.cli(&verify, 1, &[]).contains("at LSN 1,"), "{case}: names the LSN");
             }
             #[cfg(feature = "fault-inject")]
             Expect::ExitsOnPoison(replaced) => {
@@ -570,12 +523,7 @@ fn startup_checks() {
             }
         }
         if let Some((_, instance)) = &ctx.other {
-            let health = json!({"status": "ok", "instance": instance});
-            assert_eq!(
-                unix.call(None, None, "GET", "/healthz", None),
-                (200, health),
-                "{case}: first server"
-            );
+            healthy(instance, "the first server serves on");
         }
     }
 }

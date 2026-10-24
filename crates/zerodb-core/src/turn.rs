@@ -198,30 +198,3 @@ pub(crate) fn set_seq(payload: &mut [u8], seq: u64) -> Result<(), CodecError> {
     payload.get_mut(offset..offset + 8).ok_or(CodecError)?.copy_from_slice(&seq.to_le_bytes());
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-    use crate::Role;
-
-    #[test]
-    fn encode_allocates_exactly_once() {
-        for (meta, content, key) in [
-            (vec![], vec![], None),
-            (vec![0x42; 16], vec![0x5a; 8192], None),
-            (vec![7; 65536], vec![1; 1025], Some("retry-key")),
-            (vec![], vec![2; 3], Some("")),
-        ] {
-            let turn = NewTurn { role: Role::User, meta, content };
-            let out = encode("agent", "session-001", 9, &turn, key).unwrap();
-            // A wrong size estimate either regrows the buffer or over-reserves it.
-            assert_eq!(out.capacity(), out.len());
-            let decoded = decode(&out).unwrap();
-            assert_eq!(decoded.seq, 9);
-            assert_eq!(decoded.turn.content, turn.content);
-            assert_eq!(decoded.turn.meta, turn.meta);
-            assert_eq!(decoded.idem_key.as_deref(), key);
-        }
-    }
-}

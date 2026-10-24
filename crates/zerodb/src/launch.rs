@@ -266,11 +266,10 @@ mod tests {
     fn http_connects_only_to_loopback_addresses() {
         for (addrs, ok) in [
             (&["127.0.0.1:1", "[::1]:1"][..], true),
-            (&["127.0.0.1:1", "10.0.0.1:1"][..], false),
-            (&["[::ffff:192.0.2.1]:1"][..], false),
+            (&["127.0.0.1:1", "10.0.0.1:1"], false),
+            (&["[::ffff:192.0.2.1]:1"], false),
         ] {
-            let parsed = addrs.iter().map(|addr| addr.parse().unwrap()).collect();
-            let result = super::loopback(parsed);
+            let result = super::loopback(addrs.iter().map(|addr| addr.parse().unwrap()).collect());
             assert_eq!(result.is_ok(), ok, "{addrs:?}: {result:?}");
         }
     }

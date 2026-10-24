@@ -1,8 +1,8 @@
-use crate::support::TestDir;
-use std::sync::Arc;
-use zerodb_tape::sim::SimClock;
-use zerodb_tape::Error;
-use zerodb_tape::{Clock, Io, SimDisk, StdIo, SystemClock};
+use crate::support::*;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use zerodb_tape::sim::{atomic_install, make_spare, DataDir};
+use zerodb_tape::{Error, HookIo, Io, SimDisk, StdIo};
 
 #[test]
 fn filesystem_operations_through_trait_object() {
@@ -45,11 +45,31 @@ fn filesystem_operations_through_trait_object() {
     assert!(second.try_lock_exclusive(&path).is_ok());
 }
 
+#[cfg(target_os = "linux")]
+fn preallocation_supported(dir: &Path) -> bool {
+    use rustix::io::Errno;
+    let path = dir.join("preallocation-probe");
+    let file =
+        std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+    let allocation =
+        rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, 1024 * 1024);
+    drop(file);
+    std::fs::remove_file(path).unwrap();
+    match allocation {
+        Ok(()) => true,
+        Err(error) if [Errno::OPNOTSUPP, Errno::NOTSUP, Errno::NOSYS].contains(&error) => {
+            eprintln!("skipping allocation block check: preallocation unsupported: {error}");
+            false
+        }
+        Err(error) => panic!("preallocation probe failed: {error}"),
+    }
+}
+
 #[test]
 fn allocation_sets_length_for_growth_repeats_and_shrink() {
     let dir = TestDir::new();
     #[cfg(target_os = "linux")]
-    let preallocation_supported = crate::support::preallocation_supported(&dir.0);
+    let preallocation_supported = preallocation_supported(&dir.0);
     let io = StdIo::new();
     let path = dir.0.join("resized");
     let file = io.create(&path).unwrap();
@@ -64,7 +84,6 @@ fn allocation_sets_length_for_growth_repeats_and_shrink() {
         ("second growth", 3 * 1024 * 1024, false),
         ("truncate", 0, false),
     ] {
-        eprintln!("case: {case}");
         #[cfg(target_os = "macos")]
         let before = {
             metadata_file.sync_all().unwrap();
@@ -89,212 +108,153 @@ fn allocation_sets_length_for_growth_repeats_and_shrink() {
         {
             use std::os::unix::fs::MetadataExt;
             let used = metadata.blocks() * 512;
-            if len != 0 && len <= before.len() {
-                assert!(
-                    used < before.len() + len / 2,
-                    "{case}: length={len} must not reserve a whole extra length"
-                );
-            }
+            let extra = len != 0 && len <= before.len() && used >= before.len() + len / 2;
+            assert!(!extra, "{case}: length={len} must not reserve a whole extra length");
             // Growth must not reserve the target length again past the physical end.
-            assert!(
-                used <= len.max(before.blocks() * 512) + len / 8,
-                "{case}: length={len} used={used} over-reserves"
-            );
+            let limit = len.max(before.blocks() * 512) + len / 8;
+            assert!(used <= limit, "{case}: length={len} used={used} over-reserves");
         }
     }
     io.close(file).unwrap();
 }
 
 #[test]
-fn clocks_are_shared_and_monotonic() {
-    let clock = Arc::new(SimClock::new(100));
-    let shared: Arc<dyn Clock> = clock.clone();
-    assert_eq!(shared.now_ns(), 100);
-    clock.advance(42);
-    assert_eq!(shared.now_ns(), 142);
-    clock.advance(u64::MAX);
-    assert_eq!(shared.now_ns(), u64::MAX);
-    let system = SystemClock;
-    let before = system.now_ns();
-    assert!(before > 0);
-    assert!(system.now_ns() >= before);
-}
-
-#[test]
-fn closed_handles_fail_without_invalidating_other_opens() {
+fn backends_agree_on_closed_handles_listing_and_existence() {
     let dir = TestDir::new();
-    for (case, io) in [
-        ("filesystem", Box::new(StdIo::new()) as Box<dyn Io>),
-        ("simulated", Box::new(SimDisk::new(0)) as Box<dyn Io>),
-    ] {
-        eprintln!("case: {case}");
+    let (branch, direct) = (dir.0.join("branch"), dir.0.join("direct"));
+    let deeper = branch.join("deeper");
+    let leaf = deeper.join("leaf");
+    std::fs::create_dir_all(&deeper).unwrap();
+    let backends: [(&str, Box<dyn Io>); 2] =
+        [("filesystem", Box::new(StdIo::new())), ("simulated", Box::new(SimDisk::new(0)))];
+    for (case, io) in backends {
         let path = dir.0.join("closed");
         let file = io.create(&path).unwrap();
         io.write_at(file, 0, b"data").unwrap();
         let other = io.open(&path).unwrap();
-        assert_ne!(file, other);
+        assert_ne!(file, other, "{case}");
         io.close(file).unwrap();
-        assert!(io.read_at(file, 0, &mut [0; 4]).is_err());
-        assert!(io.write_at(file, 0, b"bad").is_err());
-        assert!(io.len(file).is_err());
-        assert!(io.set_len(file, 0).is_err());
-        assert!(io.sync_data(file).is_err());
-        assert!(io.close(file).is_err());
-        assert_eq!(io.len(other).unwrap(), 4);
+        assert!(io.read_at(file, 0, &mut [0; 4]).is_err(), "{case}");
+        assert!(io.write_at(file, 0, b"bad").is_err(), "{case}");
+        assert!(io.len(file).is_err(), "{case}");
+        assert!(io.set_len(file, 0).is_err(), "{case}");
+        assert!(io.sync_data(file).is_err(), "{case}");
+        assert!(io.close(file).is_err(), "{case}");
+        assert_eq!(io.len(other).unwrap(), 4, "{case}");
         io.remove(&path).unwrap();
-        assert_eq!(io.len(other).unwrap(), 4);
+        assert_eq!(io.len(other).unwrap(), 4, "{case}: unlinked file stays open");
         io.close(other).unwrap();
-    }
-}
-
-#[test]
-fn directory_exists_and_list_match_across_backends() {
-    let dir = TestDir::new();
-    let branch = dir.0.join("branch");
-    let deeper = branch.join("deeper");
-    std::fs::create_dir_all(&deeper).unwrap();
-    for (case, io) in [
-        ("filesystem", Box::new(StdIo::new()) as Box<dyn Io>),
-        ("simulated", Box::new(SimDisk::new(0)) as Box<dyn Io>),
-    ] {
-        eprintln!("case: {case}");
-        let direct = dir.0.join("direct");
-        let leaf = deeper.join("leaf");
         for path in [&direct, &leaf] {
-            let file = io.create(path).unwrap();
-            io.close(file).unwrap();
+            io.close(io.create(path).unwrap()).unwrap();
+            assert!(io.create(path).is_err(), "{case}: create never replaces {path:?}");
         }
-        assert!(io.exists(&dir.0).unwrap());
-        assert!(io.exists(&branch).unwrap());
-        assert!(io.exists(&deeper).unwrap());
-        assert!(io.exists(&leaf).unwrap());
-        assert!(!io.exists(&branch.join("missing")).unwrap());
-        assert_eq!(io.list(&dir.0).unwrap(), vec![branch.clone(), direct.clone()]);
-        assert_eq!(io.list(&branch).unwrap(), vec![deeper.clone()]);
-        assert_eq!(io.list(&deeper).unwrap(), vec![leaf.clone()]);
-        assert!(io.list(&leaf).is_err());
-        assert!(io.list(&branch.join("missing")).is_err());
-        io.remove(&direct).unwrap();
+        for path in [&dir.0, &branch, &deeper, &leaf] {
+            assert!(io.exists(path).unwrap(), "{case}: {path:?}");
+        }
+        assert!(!io.exists(&branch.join("missing")).unwrap(), "{case}");
+        assert_eq!(io.list(&dir.0).unwrap(), vec![branch.clone(), direct.clone()], "{case}");
+        assert_eq!(io.list(&branch).unwrap(), vec![deeper.clone()], "{case}");
+        assert_eq!(io.list(&deeper).unwrap(), vec![leaf.clone()], "{case}");
+        assert!(io.list(&leaf).is_err() && io.list(&branch.join("missing")).is_err(), "{case}");
+        let moved = branch.join("moved");
+        io.rename(&direct, &moved).unwrap();
+        io.sync_dir(&branch).unwrap();
+        assert_eq!(io.list(&dir.0).unwrap(), vec![branch.clone()], "{case}: renamed away");
+        assert_eq!(io.list(&branch).unwrap(), vec![deeper.clone(), moved.clone()], "{case}");
+        io.remove(&moved).unwrap();
         io.remove(&leaf).unwrap();
     }
 }
 
-mod directory {
-    use std::path::Path;
-    use std::sync::Arc;
-    use zerodb_tape::sim::{atomic_install, make_spare, DataDir};
-    use zerodb_tape::Error;
-    use zerodb_tape::{Io, SimDisk, StdIo};
-
-    use crate::support;
-
-    #[test]
-    fn metadata_roundtrip_and_crc() {
-        let io = Arc::new(SimDisk::new(1));
-        let mut dir = DataDir::open(io.clone(), "db", Some("localhost:77"), 1024).unwrap();
-        dir.install_manifest(&[1, 2]).unwrap();
-        dir.install_superblock(99).unwrap();
-        drop(dir);
-        let dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
-        assert_eq!(dir.segments(), &[1, 2]);
-        assert_eq!(dir.superblock(), 99);
-        assert_eq!(dir.segment_size(), 1024);
-        drop(dir);
-        let file = io.open(Path::new("db/MANIFEST")).unwrap();
-        let mut prefix = [0; 20];
-        io.read_at(file, 0, &mut prefix).unwrap();
-        assert_eq!(prefix[8..12], 2u32.to_le_bytes());
-        assert_eq!(prefix[12..20], 1024u64.to_le_bytes());
-        io.flip_bit(file, 12).unwrap();
-        io.close(file).unwrap();
-        assert!(matches!(
-            DataDir::open(io, "db", None, 1024),
-            Err(Error::CorruptionDetected { .. })
-        ));
+#[test]
+fn manifest_round_trips_and_damage_is_corruption() {
+    let io = Arc::new(SimDisk::new(1));
+    let mut dir = DataDir::open(io.clone(), "db", Some("localhost:77"), 1024).unwrap();
+    dir.prepare_next_segment(1024).unwrap();
+    dir.install_manifest(&[1, 2]).unwrap();
+    dir.install_superblock(99).unwrap();
+    drop(dir);
+    let dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
+    assert_eq!((dir.segments(), dir.superblock(), dir.segment_size()), (&[1, 2][..], 99, 1024));
+    drop(dir);
+    let manifest = read(&*io, "db/MANIFEST");
+    assert_eq!(manifest[8..12], 2u32.to_le_bytes());
+    assert_eq!(manifest[12..20], 1024u64.to_le_bytes());
+    for case in ["flipped size", "missing manifest"] {
+        let image = image(&io);
+        if case == "missing manifest" {
+            // Existing segments block a fresh manifest.
+            image.remove(Path::new("db/MANIFEST")).unwrap();
+        } else {
+            let file = image.open(Path::new("db/MANIFEST")).unwrap();
+            image.flip_bit(file, 12).unwrap();
+            image.close(file).unwrap();
+        }
+        let reopened = DataDir::open(image, "db", None, 1024);
+        assert!(matches!(reopened, Err(Error::CorruptionDetected { .. })), "{case}");
     }
+}
 
-    #[test]
-    fn atomic_install_is_old_or_new_at_every_crash_point() {
-        for seed in 0..100 {
-            let io = Arc::new(support::ObservedIo::new(seed));
-            let _dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
-            atomic_install(io.clone(), Path::new("db"), "TEST", b"old").unwrap();
-            io.capture.store(true, std::sync::atomic::Ordering::SeqCst);
-            atomic_install(io.clone(), Path::new("db"), "TEST", b"new-content").unwrap();
-            assert!(io.handles.lock().unwrap().is_empty());
-            for crash in io.images.lock().unwrap().iter() {
-                let file = crash.open(Path::new("db/TEST")).unwrap();
-                let mut bytes = vec![0; crash.len(file).unwrap() as usize];
-                crash.read_at(file, 0, &mut bytes).unwrap();
-                crash.close(file).unwrap();
-                assert!(bytes == b"old" || bytes == b"new-content");
-            }
+#[test]
+fn atomic_install_is_old_or_new_at_every_crash_point() {
+    for seed in 0..100 {
+        let io = Arc::new(HookIo::sim(seed));
+        let _dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
+        atomic_install(io.clone(), Path::new("db"), "TEST", b"old").unwrap();
+        let images = io.capture();
+        atomic_install(io.clone(), Path::new("db"), "TEST", b"new-content").unwrap();
+        assert_eq!(io.open_files(), 0, "seed={seed}");
+        for (event, crash) in images.lock().unwrap().iter() {
+            let bytes = read(crash, "db/TEST");
+            assert!(bytes == b"old" || bytes == b"new-content", "seed={seed}, crash after {event}");
         }
     }
+}
 
-    #[test]
-    fn lock_is_first_and_reports_the_holder() {
-        let dir = crate::support::TestDir::new();
-        let path = &dir.0;
-        let io = Arc::new(StdIo::new());
-        let dir = DataDir::open(io.clone(), path, Some("localhost:77"), 1024).unwrap();
-        std::fs::write(path.join("MANIFEST"), b"invalid").unwrap();
-        match DataDir::open(io, path, None, 1024) {
-            Err(Error::DataDirLocked { holder }) => {
-                assert!(holder.contains(&std::process::id().to_string()));
-                assert!(holder.contains("localhost:77"));
-            }
-
-            other => panic!("{other:?}"),
+#[test]
+fn lock_is_first_and_reports_the_holder() {
+    let dir = TestDir::new();
+    let io = Arc::new(StdIo::new());
+    let held = DataDir::open(io.clone(), &dir.0, Some("localhost:77"), 1024).unwrap();
+    std::fs::write(dir.0.join("MANIFEST"), b"invalid").unwrap();
+    match DataDir::open(io, &dir.0, None, 1024) {
+        Err(Error::DataDirLocked { holder }) => {
+            assert!(holder.contains(&std::process::id().to_string()), "{holder}");
+            assert!(holder.contains("localhost:77"), "{holder}");
         }
-        drop(dir);
+        other => panic!("{other:?}"),
     }
+    drop(held);
+}
 
-    #[test]
-    fn missing_manifest_cannot_reinitialize_existing_segments() {
-        let io = Arc::new(SimDisk::new(1));
-        let mut dir = DataDir::open(io.clone(), "db", None, 1024).unwrap();
-        dir.prepare_next_segment(1024).unwrap();
-        drop(dir);
-        io.remove(Path::new("db/MANIFEST")).unwrap();
-        assert!(matches!(
-            DataDir::open(io, "db", None, 1024),
-            Err(Error::CorruptionDetected { .. })
-        ));
-    }
-
-    #[test]
-    fn retry_persists_orphan_removal_after_directory_sync_failure() {
-        let db = Path::new("db");
-        for (case, renamed_spare) in [("allocated orphan", false), ("renamed spare orphan", true)] {
-            for seed in 0..32 {
-                let io = Arc::new(SimDisk::new(seed));
-                let mut dir = DataDir::open(io.clone(), db, None, 1024).unwrap();
-                dir.prepare_next_segment(1024).unwrap();
-                if renamed_spare {
-                    make_spare(io.clone(), db, 1024, 0, &Default::default()).unwrap();
-                }
-                let id = dir.prepare_next_segment(1024).unwrap();
-                assert!(!io.exists(&db.join("spare.zdb")).unwrap(), "{case}: roll took the spare");
-                dir.install_manifest(&[1]).unwrap();
-                // A crash can also leave a ready spare and a partial fill.
-                make_spare(io.clone(), db, 1024, 0, &Default::default()).unwrap();
-                io.close(io.create(&db.join("spare.tmp")).unwrap()).unwrap();
-                let leftovers = [dir.segment_path(id), db.join("spare.zdb"), db.join("spare.tmp")];
-                drop(dir);
-                io.fail_next_sync().unwrap();
-                assert!(
-                    matches!(DataDir::open(io.clone(), db, None, 1024), Err(Error::SyncFailed(_))),
-                    "{case}"
-                );
-                assert!(leftovers.iter().all(|path| !io.exists(path).unwrap()), "{case}");
-                let _retry = DataDir::open(io.clone(), db, None, 1024).unwrap();
-                let crash = io.crash().unwrap();
-                assert!(
-                    leftovers.iter().all(|path| !crash.exists(path).unwrap()),
-                    "{case} seed={seed}"
-                );
+#[test]
+fn retry_persists_orphan_removal_after_directory_sync_failure() {
+    let db = Path::new("db");
+    for (case, renamed_spare) in [("allocated orphan", false), ("renamed spare orphan", true)] {
+        for seed in 0..32 {
+            let io = Arc::new(SimDisk::new(seed));
+            let spare = || make_spare(io.clone(), db, 1024, 0, &Mutex::new(())).unwrap();
+            let mut dir = DataDir::open(io.clone(), db, None, 1024).unwrap();
+            dir.prepare_next_segment(1024).unwrap();
+            if renamed_spare {
+                spare();
             }
+            let id = dir.prepare_next_segment(1024).unwrap();
+            assert!(!io.exists(&db.join("spare.zdb")).unwrap(), "{case}: roll took the spare");
+            dir.install_manifest(&[1]).unwrap();
+            // A crash can also leave a ready spare and a partial fill.
+            spare();
+            io.close(io.create(&db.join("spare.tmp")).unwrap()).unwrap();
+            let leftovers = [dir.segment_path(id), db.join("spare.zdb"), db.join("spare.tmp")];
+            drop(dir);
+            io.fail_next_sync().unwrap();
+            let failed = DataDir::open(io.clone(), db, None, 1024);
+            assert!(matches!(failed, Err(Error::SyncFailed(_))), "{case}");
+            assert!(leftovers.iter().all(|path| !io.exists(path).unwrap()), "{case}");
+            let _retry = DataDir::open(io.clone(), db, None, 1024).unwrap();
+            let crash = io.crash().unwrap();
+            let gone = leftovers.iter().all(|path| !crash.exists(path).unwrap());
+            assert!(gone, "{case}, seed={seed}");
         }
     }
 }

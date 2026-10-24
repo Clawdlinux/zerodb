@@ -18,6 +18,8 @@ pub(crate) mod crc32c;
 pub(crate) mod dir;
 mod error;
 pub(crate) mod frame;
+#[cfg(any(test, feature = "sim"))]
+pub mod hook;
 pub(crate) mod io;
 mod lsn_index;
 pub(crate) mod recovery;
@@ -32,6 +34,8 @@ pub(crate) mod writer;
 pub use crc32c::crc32c;
 pub use error::{Error, Result};
 pub use frame::{Digest, Frame, Header, Kind};
+#[cfg(any(test, feature = "sim"))]
+pub use hook::{HookIo, Next, Op};
 pub use io::{Clock, FileId, Io, LockGuard, StdIo, SystemClock};
 pub use lsn_index::LsnIndexStats;
 pub use recovery::RecoveryReport;

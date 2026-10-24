@@ -1,5 +1,4 @@
-use crate::support::facts::{new_fact, query};
-use crate::support::sessions::{open, options};
+use crate::support::{new_fact, open, options, query};
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use zerodb_core::{
