@@ -1356,3 +1356,72 @@ On managed disks an ack costs one device write round trip: about 1.9 ms on Premi
 The engine adds 1% to 5% over a bare `pwrite` plus `fdatasync`. Zero-fill does not change 1 or 4 writers there, and adds 28% throughput at 16.
 On local NVMe the round trip is about 60 µs, so the journal commit that zero-fill removes was most of the ack.
 Ultra Disk was not available in zone 3.
+
+## #52 writer hot path A/B (2026-10-24)
+
+Azure Standard_L8s_v3, local NVMe, ext4. G1 at 16, 64 and 128 writers, 5 reps each.
+Systems ran interleaved in one VM session, because of #48. Redis is the control.
+Ratio is the median of per-rep throughput ratios to `main` (`8a66c83`), with min to max in brackets.
+Writer µs/append is writer thread CPU time per append.
+
+| Writers | System | Turns/s | p99 µs | p99.9 µs | Writer µs/append | Ratio |
+|---|---|---|---|---|---|---|
+| 16 | main | 48,587 | 508 | 696 | 15.12 | 1.000 |
+| | hash once (#55, first version) | 50,471 | 448 | 536 | 14.25 | 1.041 |
+| | pwrite (#54) | 48,886 | 510 | 666 | 14.88 | 1.006 |
+| | reply wakeups (#53) | 48,435 | 520 | 676 | 12.75 | 1.002 |
+| | Redis | 42,612 | 574 | 643 | - | 0.926 |
+| 64 | main | 64,135 | 1,782 | 2,899 | 12.06 | 1.000 |
+| | hash once | 67,028 | 1,316 | 2,078 | 11.25 | 1.051 (1.037-1.053) |
+| | pwrite | 64,791 | 1,774 | 3,034 | 11.84 | 1.011 (1.004-1.013) |
+| | reply wakeups | 65,022 | 1,790 | 3,278 | 9.03 | 1.013 (1.004-1.016) |
+| | Redis | 73,970 | 1,610 | 1,717 | - | 1.144 |
+| 128 | main | 66,550 | 3,563 | 8,702 | 11.16 | 1.000 |
+| | hash once | 69,458 | 2,611 | 8,346 | 10.34 | 1.044 (1.027-1.062) |
+| | pwrite | 67,178 | 3,606 | 8,441 | 10.97 | 1.010 (1.008-1.014) |
+| | reply wakeups | 68,116 | 3,481 | 8,095 | 8.14 | 1.028 (0.990-1.037) |
+| | Redis | 79,116 | 3,134 | 3,304 | - | 1.195 |
+
+Writer syscalls at 128 writers, 640k appends, from `perf stat`:
+
+| System | write | lseek | pwrite64 | futex | fdatasync |
+|---|---|---|---|---|---|
+| main | 641,771 | 641,771 | 0 | 803,469 | 8,284 |
+| pwrite | 0 | 0 | 641,771 | unchanged | unchanged |
+| reply wakeups | unchanged | unchanged | 0 | 89,631 | 11,186 |
+| hash once | unchanged | unchanged | 0 | 775,534 | unchanged |
+
+The hash-once rows above are #55's first version. Review moved its shard bits and kept the hash in each entry. That version, `e3d20e7`, against the same `main` in a later session:
+
+| Writers | Turns/s main → #55 | Ratio | p99 µs | p99.9 µs | Writer µs/append |
+|---|---|---|---|---|---|
+| 16 | 49,065 → 52,004 | 1.065 (1.052-1.085) | 500 → 436 | 668 → 521 | 14.88 → 13.50 |
+| 64 | 65,406 → 70,120 | 1.073 (1.062-1.078) | 1,727 → 1,259 | 3,026 → 1,907 | 11.75 → 10.53 |
+| 128 | 68,813 → 74,532 | 1.080 (1.079-1.086) | 3,397 → 2,428 | 8,294 → 8,104 | 10.81 → 9.61 |
+
+Premium SSD v2, 128 GiB, 3,000 IOPS, host caching off, 2,000 appends per writer, same method, with #55 at `e3d20e7`:
+
+| Writers | System | Turns/s | p99 µs | p99.9 µs | Ratio |
+|---|---|---|---|---|---|
+| 16 | main | 9,588 | 2,590 | 3,168 | 1.000 |
+| | hash once | 9,785 | 2,392 | 3,019 | 1.038 (0.969-1.041) |
+| | pwrite | 9,629 | 2,522 | 3,277 | 1.009 (0.987-1.034) |
+| | reply wakeups | 10,285 | 2,418 | 2,963 | 1.069 (1.047-1.093) |
+| | Redis | 5,162 | 5,085 | 5,675 | 0.548 |
+| 64 | main | 31,480 | 3,610 | 5,129 | 1.000 |
+| | hash once | 32,773 | 3,538 | 5,085 | 1.046 (0.926-1.066) |
+| | pwrite | 32,505 | 3,334 | 4,711 | 1.020 (0.892-1.547) |
+| | reply wakeups | 32,085 | 3,189 | 5,223 | 1.019 (0.886-1.222) |
+| | Redis | 21,403 | 5,864 | 7,797 | 0.674 |
+| 128 | main | 44,515 | 5,124 | 12,150 | 1.000 |
+| | hash once | 47,633 | 4,661 | 12,844 | 1.075 (1.065-1.080) |
+| | pwrite | 44,964 | 4,956 | 9,625 | 1.015 (1.002-1.019) |
+| | reply wakeups | 44,990 | 4,650 | 11,732 | 1.018 (1.000-1.023) |
+| | Redis | 34,935 | 7,078 | 9,892 | 0.788 |
+
+Hashing once gives the most: 6.5% to 8% on NVMe, with p99 27% to 29% lower at 64 and 128 writers. Review's fixes added about 2 points over the first version.
+Reply wakeups cut writer futex calls 9x and writer CPU per append about 27%. NVMe throughput gains only 1% to 3%: groups get smaller, so `fdatasync` calls rise, and the load client shares the 8 vCPUs. On Premium SSD v2 they add 7% at 16 writers.
+`pwrite` halves write syscalls for 1% to 2%. So syscalls are not the bottleneck, and coalescing a group into 1 write is deferred.
+No change regresses p99 on Premium SSD v2. Its 64-writer runs were noisy for every system.
+Redis is still 10% to 21% ahead on NVMe at 64 and 128 writers. On Premium SSD v2 zerodb leads, because each Redis ack pays 2 device round trips.
+VM time was about 20 minutes for the first NVMe session and about 18 for the second plus Premium SSD v2, roughly $0.55 in all.
