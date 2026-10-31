@@ -26,6 +26,41 @@ The config is JSON: `{"data_dir", "listen", "unix_socket", "unix_socket_group", 
 Flags override fields. It must be a regular file owned by you with no group or other bits.
 Tenant names are 1 to 255 bytes. Tokens are 32 to 1024 bytes of visible ASCII, so the `Authorization` header fits the 16 KiB request head. Duplicate names or tokens fail.
 
+## Run a server by hand
+
+From a checkout:
+
+```sh
+cargo build -p atticdb --release
+export PATH="$PWD/target/release:$PATH"
+TOKEN=$(atticdb init --config atticdb.json --tenant me)   # 0600 config, token printed once
+atticdb serve --config atticdb.json --data-dir ./data &    # TCP 127.0.0.1:7425 and ./data/atticdb.sock
+curl -s -H "Authorization: Bearer $TOKEN" \
+  -d '{"agent":"planner","session":"run-1","idem_key":"k1","turns":[{"role":"user","content":"hi"}]}' \
+  http://127.0.0.1:7425/v1/append
+curl -s --unix-socket data/atticdb.sock -H "Authorization: Bearer $TOKEN" \
+  'http://localhost/v1/window?agent=planner&session=run-1&last=10'
+```
+
+That appends over TCP and reads over the Unix socket. A repeated `idem_key` returns `"deduplicated": true`. Facts live at `/v1/facts/put`, `get`, `list` and `delete`. Each key holds 1 current value, and a later put replaces it. With `"if_lsn": <lsn>`, a put writes only if the current value still has that LSN. A mismatch is 409 `conflict`.
+
+## Keys
+
+Each tenant has 1 key space. Keys are 1 to 1024 bytes and never go in URL paths. Agents keep keys apart with prefixes such as `repo/<area>/`. A prefix matches bytes, so `repo/pay` also matches `repo/payments/`. End it with `/` to match whole path segments.
+
+## Where to keep the data directory
+
+Every write is acked only after `fdatasync`, so the disk under the data directory sets your write latency. Keep it on a local disk:
+
+| Data directory on | Status |
+|---|---|
+| Local NVMe or SATA SSD | Tested on NVMe with Linux ext4. An ack costs about 1 device round trip, about 60 µs on NVMe. macOS APFS is tested for development |
+| Network block SSD, such as Azure Premium SSD v2 or P30 | Tested with Linux ext4. An ack costs 1 device round trip: about 1.9 ms on Premium SSD v2 and 4.4 ms on P30 |
+| HDD | Untested. It should work, but each ack waits for a sync to a spinning disk, which takes milliseconds |
+| NFS, SMB, FUSE mounts, or folders synced by iCloud Drive, Dropbox, OneDrive or Google Drive | Don't. `fsync` and `flock` guarantees vary on these, and sync clients copy files while they're being written |
+
+The data directory must be mode `0700` (D75). Windows has no modes, so there it must be inside the user profile (D92). Below a free-space floor AtticDB goes read-only and keeps serving reads (I14).
+
 ## Set up
 
 ```sh
@@ -221,6 +256,10 @@ Branch on `outcome`, never on the status alone. One call is one `idem_key`, reus
 
 ## `atticdb mcp`
 
+`atticdb mcp` gives the model `memory_append`, `memory_recent`, `fact_set`, `fact_get`, `fact_list` and `memory_search`. Search finds turns and current facts by words, across every session, newest first. It starts the server if none is running.
+The model can read and write any session in the tenant. Don't give it to a model you don't trust with the whole tenant.
+The server's instructions tell the model when to read memory and what to save. Claude Code and Codex read them.
+
 Newline-delimited JSON-RPC 2.0 on stdin and stdout. Logs go to stderr. It exits 0 when stdin closes.
 Tools: `memory_append {content, role?, session?, meta?}`, `memory_recent {n?, session?, max_bytes?}`, the fact tools, and `memory_search {query, limit?, before?, max_bytes?}`.
 Read tools carry `readOnlyHint: true`, so VS Code runs them without asking. `initialize` returns short `instructions`: use the memory block, and where to save rules and notes. Copilot CLI adds a server's instructions to the system prompt only for allowlisted servers, or with `--allow-all-mcp-server-instructions`.
@@ -246,9 +285,10 @@ That is `--agent copilot` for the `connect copilot` entry. A bare `atticdb mcp` 
 The token comes from `--token-file`, `ATTICDB_TOKEN`, or the config entry for `--tenant`. A token file must be 0600 and yours.
 
 With none of `--url`, `--data-dir`, `--config`, `--token-file` or `--tenant`, it uses a per-user home and its token.
+Any connection flag skips the home. Use absolute paths in flags.
 It then ignores `ATTICDB_TOKEN`, and says so once on stderr. The token is never sent.
 On macOS the home is `~/Library/Application Support/atticdb`. On Linux it is `$XDG_DATA_HOME/atticdb`, else `~/.local/share/atticdb`.
-`ATTICDB_HOME`, when set and not empty, is the home instead. It moves only the home. The harness files that `connect` edits stay where they are.
+`ATTICDB_HOME`, when set and not empty, is the home instead. Use it for a test folder, for example. Empty counts as unset. It moves only the home. The harness files that `connect` edits stay where they are.
 It must be an absolute path. A relative one fails `mcp`, `connect`, `studio` and the shell verbs with exit 2 before they start. The hook prints `{}` for it.
 The first use creates it with mode 0700, `atticdb.json` with tenant `me` at 0600, and `data/` at 0700.
 The home and `data/` must be yours, with no group or other bits. The shell verbs use the same home.
@@ -271,7 +311,44 @@ How it finds a server:
 
 An auto-started server runs in its own process group and outlives the adapters. Stop it with `kill <pid>`. The pid is in `<data_dir>/LOCK`.
 
+### Secrets
+
+Before `memory_append` and `fact_set` write, AtticDB replaces secrets in the content and in every `meta` string with placeholders such as `[secret:github-token]`.
+The shell verbs `append` and `fact set` do the same. The result's `redacted` field counts what was replaced, by type.
+It looks for these:
+
+- the values of env vars whose names end in `_KEY`, `_TOKEN`, `_SECRET` or `_PAT`, or contain `PASSWORD`, if 12 bytes or longer;
+- GitHub tokens, AWS key ids, Slack tokens, Stripe live keys, Anthropic and OpenAI keys;
+- private key blocks, `Bearer` tokens, and passwords in URLs.
+
+It is best effort. A secret that was changed, split or encoded gets through, so don't save secrets.
+
+## Shell verbs
+
+The same 6 tools run from a shell, with `atticdb mcp`'s connection flags. Each prints 1 JSON line. `fact set --delete` deletes.
+
+```sh
+export ATTICDB_TOKEN=$TOKEN
+Z="--url unix://$PWD/data/atticdb.sock --agent planner --session run-1"
+atticdb append $Z --content "hi" --role user          # {"committed":true,"deduplicated":false,"lsn":3,"seq":2}
+atticdb recent $Z --n 10                              # {"truncated":false,"turns":[...]}
+atticdb fact set $Z --key repo/payments/retry-rule --content "Retry 3 times, then fail."
+atticdb fact get $Z --key repo/payments/retry-rule    # {"fact":{"agent":"planner","content":...}}
+atticdb fact list $Z --prefix repo/ --limit 50        # {"facts":[...],"next":null}
+atticdb search $Z --query "retry rule"                # {"hits":[...],"next":null}
+```
+
+Each write picks 1 random `idem_key` and retries with it until `--retry-deadline` (default 30 s). Exit 0 means done. Exit 1 means nothing was written, or a read failed. Exit 2 is a usage error.
+Exit 3 means the write may have landed. Running the command again uses a new key, so it can write a duplicate.
+
 ## `atticdb connect` and `atticdb disconnect`
+
+Add AtticDB to VS Code's Copilot chat or to Copilot CLI with 1 command:
+
+```sh
+atticdb connect vscode       # or: atticdb connect copilot
+atticdb disconnect vscode    # removes only AtticDB's entry
+```
 
 `atticdb connect <vscode|copilot> [--force] [--dry-run]` creates the home, then adds an `atticdb` entry to the harness's user MCP config.
 With `--dry-run`, any `connect` prints 1 line per file and part saying what it would do, and creates and runs nothing. `atticdb setup` shows that plan too.
@@ -293,11 +370,11 @@ Both harnesses share the hook, which reads 1 home, so their entries must pass th
 `connect` refuses a home that differs from the other connected harness's, and changes nothing.
 The message names that harness and both homes. No `env` means the default home.
 `--force` goes ahead, then says which harness still uses the other home.
-Install it first, with the installer in the [top README](../../README.md#quick-start) or `cargo install --git https://github.com/Clawdlinux/atticdb atticdb --locked`. An entry that points into `target/` breaks on `cargo clean`.
+Install it first, with the installer in the [top README](../../README.md#install) or `cargo install --git https://github.com/Clawdlinux/atticdb atticdb --locked`. An entry that points into `target/` breaks on `cargo clean`.
 Neither entry passes `--session`, so the session is the repo the client works in. That is the session the hook reads.
 VS Code reports its workspace folders as roots, and the first one names the session.
 Copilot's agent host and Copilot CLI start the adapter in the working folder, which names it.
-Run `connect` again to update an older entry.
+After upgrading AtticDB, run `connect` again to update an older entry. It reports `updated` when the entry changed.
 An old entry with `--url`, `--data-dir`, `--config`, `--token-file` or `--tenant` keeps its own store.
 `connect` refuses to replace it and exits 1. The config file is not changed. `--force` replaces it anyway.
 The message says how to keep that memory. Quit VS Code and Copilot CLI, then stop that store's server.
@@ -326,6 +403,12 @@ The rules above apply: no write when it matches, a backup, a synced temp file an
 `disconnect` deletes it once neither config has an AtticDB entry, then syncs the directory. No backup is kept.
 It deletes the hook AtticDB writes for any absolute binary path, with or without that env. So a moved binary's hook goes too.
 A hook file with other content is left alone, and `disconnect` says so.
+To turn the memory block off, delete the hook file, or disconnect both harnesses.
+
+`connect` also writes the server's instructions to `~/.copilot/instructions/atticdb.instructions.md`, as Copilot may not read them from the server.
+The file holds the line `<!-- written by atticdb connect -->`. Without it, the file is yours, and AtticDB never changes or removes it.
+`connect` also skips the file when another `.instructions.md` file there mentions AtticDB, and says which.
+Disconnecting both harnesses removes it, unless you edited it.
 
 ### Claude Code
 
@@ -503,8 +586,14 @@ Turns are listed oldest first. A section with no entries is left out.
 Each content is cut to 300 characters, and its newlines become spaces.
 Past 6,000 characters the block stops at a whole line and ends with `(more in atticdb)`.
 The block depends only on the repo and memory, so the prompt prefix stays the same until memory changes.
+It is a snapshot. The model can call `memory_search` or `fact_list` for more.
 
 ## `atticdb studio`
+
+```sh
+atticdb studio             # the home, opens your browser
+atticdb studio --no-open   # only prints the link
+```
 
 `atticdb studio [<flags>] [--no-open]` serves a read-only web page about the store, on loopback.
 It takes `--url`, `--data-dir`, `--config`, `--tenant` and `--token-file`, as `atticdb mcp` does.

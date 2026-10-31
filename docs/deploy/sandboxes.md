@@ -2,6 +2,8 @@
 
 Run `atticdb serve` on the host or in a sidecar. Never run it inside a disposable sandbox.
 By default the harness outside the sandbox holds memory, and sandboxed code gets no access (D79).
+The harness is the trusted loop that calls the model and starts sandboxes. It reads the window and facts, builds the prompt and appends results.
+Code in a microVM or container gets no token and no socket, because a token grants a whole tenant.
 This guide is for agents inside sandboxes that reach it through its Unix socket.
 A token grants its whole tenant. Use these recipes only for code you trust with that tenant, or give each sandbox a tenant of its own.
 There is no container image yet.

@@ -96,7 +96,7 @@ Hooks added later run inside earlier ones. `fail_once` faults run first, so obse
 
 ## Simulations
 
-The sim commands in the [README](README.md#build-and-test) run 2,000 seeds.
+The sim commands in [CONTRIBUTING.md](CONTRIBUTING.md#build-and-test) run 2,000 seeds.
 Both sims vary disk headroom around the free-space floor and release space before retrying.
 Each seed chooses the capacity phase's generation, covering fresh and recovered writers.
 Floor rejections must issue no segment writes, including unpublished frames.
